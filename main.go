@@ -1,7 +1,12 @@
-// Package main implements the GoProxy entry point: process lifecycle,
-// config loading, logger construction, TLS listener setup, HTTP/HTTPS
-// server bootstrap, mux route wiring (healthz/metrics/proxy), signal
-// handling (SIGINT/SIGTERM), and graceful shutdown orchestration.
+// Package main implements the GoProxy entry point and all core
+// application logic (config loading, load balancing, reverse proxy data
+// plane, metrics, and process lifecycle) in a single file. This
+// consolidation ensures the binary can be built successfully regardless
+// of whether the build invocation compiles the whole package directory
+// (e.g. `go build .`) or lists a single entry file explicitly (e.g.
+// `go build main.go`) -- the latter previously failed with "undefined"
+// errors because symbols defined in sibling files (config.go, balancer.go,
+// proxy.go, metrics.go) are not visible to a single-file compile.
 //
 // Uses only the standard library "log" package (not "log/slog") to
 // remain compatible with Go 1.19+ build environments, and only stdlib
@@ -15,187 +20,746 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-func envOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+// ErrNoHealthyBackends is returned by Pool.Choose when no backend in the
+// pool is currently marked alive.
+var ErrNoHealthyBackends = errors.New("no healthy backends available")
+
+// ===========================================================================
+// Config: struct definitions + LoadConfig + minimal YAML-subset parser
+// ===========================================================================
+
+// Config is the root configuration document.
+type Config struct {
+	Server ServerConfig
+	Routes []RouteConfig
+	Pools  []PoolConfig
 }
 
-func main() {
-	// Lightweight CLI subcommand used by the container HEALTHCHECK
-	// directive (see Dockerfile): performs a local HTTP GET against this
-	// process's own /healthz endpoint and exits 0 on success, 1 otherwise.
-	// This must be checked before flag.Parse() since it is a positional
-	// subcommand, not a flag.
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		os.Exit(runHealthcheckCLI())
-	}
-
-	configPath := flag.String("config", envOrDefault("CONFIG_PATH", "config.yaml"), "path to config file")
-	logLevel := flag.String("log-level", envOrDefault("LOG_LEVEL", "info"), "log level (unused by std log, kept for CLI compatibility)")
-	flag.Parse()
-	_ = *logLevel
-
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	if err := run(ctx, logger, *configPath); err != nil {
-		logger.Printf("ERROR fatal startup error: %v", err)
-		os.Exit(1)
-	}
+// ServerConfig configures the HTTP/HTTPS listeners and TLS/timeouts.
+type ServerConfig struct {
+	HTTPAddr             string
+	HTTPSAddr            string
+	EnableTLS            bool
+	ShutdownGraceSeconds int
+	TLS                  TLSConfig
+	Timeouts             TimeoutsConfig
 }
 
-// runHealthcheckCLI implements the "healthcheck" subcommand: it issues a
-// GET request to the local /healthz endpoint and returns a process exit
-// code (0 = healthy, 1 = unhealthy/unreachable). The target address can be
-// overridden via HEALTHCHECK_ADDR; otherwise it defaults to the configured
-// HTTP listener address on loopback.
-func runHealthcheckCLI() int {
-	addr := envOrDefault("HEALTHCHECK_ADDR", "")
-	if addr == "" {
-		port := envOrDefault("HEALTHCHECK_PORT", "8080")
-		addr = fmt.Sprintf("http://127.0.0.1:%s/healthz", port)
-	}
+// TLSConfig describes the TLS certificate/key material and minimum
+// protocol version for the HTTPS listener.
+type TLSConfig struct {
+	CertFile   string
+	KeyFile    string
+	MinVersion string // "1.2" (default) or "1.3"
 
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(addr)
-	if err != nil {
-		return 1
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return 0
-	}
-	return 1
+	CertPEM []byte
+	KeyPEM  []byte
 }
 
-func run(ctx context.Context, logger *log.Logger, configPath string) error {
-	cfg, err := LoadConfig(ctx, configPath)
+// TimeoutsConfig holds parsed HTTP server timeouts.
+type TimeoutsConfig struct {
+	ReadHeaderDur time.Duration
+	ReadDur       time.Duration
+	WriteDur      time.Duration
+	IdleDur       time.Duration
+}
+
+// RouteConfig maps a path-prefix match to a named pool.
+type RouteConfig struct {
+	Match string
+	Pool  string
+}
+
+// PoolConfig describes an upstream pool: its backends, LB strategy, and
+// active health-check policy.
+type PoolConfig struct {
+	Name        string
+	Strategy    string
+	Backends    []BackendConfig
+	HealthCheck HealthCheckConfig
+}
+
+// BackendConfig is a single upstream target URL.
+type BackendConfig struct {
+	URL string
+}
+
+// HealthCheckConfig configures active health probing for a pool.
+type HealthCheckConfig struct {
+	Enabled            bool
+	Path               string
+	UnhealthyThreshold int
+	HealthyThreshold   int
+
+	IntervalDur time.Duration
+	TimeoutDur  time.Duration
+}
+
+// LoadConfig reads and parses the YAML config file at path into a Config.
+func LoadConfig(ctx context.Context, path string) (*Config, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return nil, fmt.Errorf("read config file %q: %w", path, err)
 	}
 
-	pools := make(map[string]*Pool, len(cfg.Pools))
-	poolList := make([]*Pool, 0, len(cfg.Pools))
-	for _, pc := range cfg.Pools {
-		pool, err := NewPool(pc)
-		if err != nil {
-			return fmt.Errorf("build pool %q: %w", pc.Name, err)
-		}
-		pools[pool.Name] = pool
-		poolList = append(poolList, pool)
+	lines := tokenizeYAML(data)
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("config file %q is empty", path)
 	}
 
-	router, err := NewRouter(cfg.Routes, pools)
-	if err != nil {
-		return fmt.Errorf("build router: %w", err)
+	pos := 0
+	root := parseMap(lines, &pos, lines[0].indent)
+
+	cfg := &Config{}
+
+	serverMap := asMap(root["server"])
+	cfg.Server.HTTPAddr = asString(serverMap["http_addr"])
+	if cfg.Server.HTTPAddr == "" {
+		cfg.Server.HTTPAddr = ":8080"
+	}
+	cfg.Server.HTTPSAddr = asString(serverMap["https_addr"])
+	if cfg.Server.HTTPSAddr == "" {
+		cfg.Server.HTTPSAddr = ":8443"
+	}
+	cfg.Server.EnableTLS = asBool(serverMap["enable_tls"])
+	cfg.Server.ShutdownGraceSeconds = asInt(serverMap["shutdown_grace_seconds"])
+	if cfg.Server.ShutdownGraceSeconds <= 0 {
+		cfg.Server.ShutdownGraceSeconds = 15
 	}
 
-	metrics := NewMetrics()
-	proxyServer := NewProxyServer(router, metrics, logger)
-
-	healthCtx, cancelHealth := context.WithCancel(ctx)
-	defer cancelHealth()
-	for _, pool := range poolList {
-		if pool.HealthCheckEnabled() {
-			go pool.RunHealthChecks(healthCtx, logger)
-		}
-	}
-
-	hc := newHealthCheckerAdapter(poolList)
-	mux := NewMux(proxyServer, metrics, hc, logger)
-
-	srv := &http.Server{
-		Addr:              cfg.Server.HTTPAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
-		ReadTimeout:       cfg.Server.Timeouts.ReadDur,
-		WriteTimeout:      cfg.Server.Timeouts.WriteDur,
-		IdleTimeout:       cfg.Server.Timeouts.IdleDur,
-	}
-
-	var servers []*http.Server
-	servers = append(servers, srv)
-
-	go func() {
-		logger.Printf("INFO http listener starting addr=%s", cfg.Server.HTTPAddr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Printf("ERROR http listener failed: %v", err)
-		}
-	}()
+	tlsMap := asMap(serverMap["tls"])
+	cfg.Server.TLS.CertFile = asString(tlsMap["cert_file"])
+	cfg.Server.TLS.KeyFile = asString(tlsMap["key_file"])
+	cfg.Server.TLS.MinVersion = asString(tlsMap["min_version"])
 
 	if cfg.Server.EnableTLS {
-		tlsCfg, err := buildTLSConfig(&cfg.Server.TLS)
-		if err != nil {
-			return fmt.Errorf("build tls config: %w", err)
-		}
-
-		httpsSrv := &http.Server{
-			Addr:              cfg.Server.HTTPSAddr,
-			Handler:           mux,
-			TLSConfig:         tlsCfg,
-			ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
-			ReadTimeout:       cfg.Server.Timeouts.ReadDur,
-			WriteTimeout:      cfg.Server.Timeouts.WriteDur,
-			IdleTimeout:       cfg.Server.Timeouts.IdleDur,
-		}
-		servers = append(servers, httpsSrv)
-
-		go func() {
-			logger.Printf("INFO https listener starting addr=%s", cfg.Server.HTTPSAddr)
-			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Printf("ERROR https listener failed: %v", err)
+		if cfg.Server.TLS.CertFile != "" {
+			certPEM, err := os.ReadFile(cfg.Server.TLS.CertFile)
+			if err != nil {
+				return nil, fmt.Errorf("read tls cert file %q: %w", cfg.Server.TLS.CertFile, err)
 			}
-		}()
-	} else {
-		logger.Printf("WARN tls disabled; running http-only")
+			cfg.Server.TLS.CertPEM = certPEM
+		}
+		if cfg.Server.TLS.KeyFile != "" {
+			keyPEM, err := os.ReadFile(cfg.Server.TLS.KeyFile)
+			if err != nil {
+				return nil, fmt.Errorf("read tls key file %q: %w", cfg.Server.TLS.KeyFile, err)
+			}
+			cfg.Server.TLS.KeyPEM = keyPEM
+		}
 	}
 
-	<-ctx.Done()
-	logger.Printf("INFO shutdown signal received")
-	cancelHealth()
+	timeoutsMap := asMap(serverMap["timeouts"])
+	cfg.Server.Timeouts.ReadHeaderDur = parseDurationOr(asString(timeoutsMap["read_header"]), 5*time.Second)
+	cfg.Server.Timeouts.ReadDur = parseDurationOr(asString(timeoutsMap["read"]), 15*time.Second)
+	cfg.Server.Timeouts.WriteDur = parseDurationOr(asString(timeoutsMap["write"]), 15*time.Second)
+	cfg.Server.Timeouts.IdleDur = parseDurationOr(asString(timeoutsMap["idle"]), 60*time.Second)
 
-	grace := time.Duration(cfg.Server.ShutdownGraceSeconds) * time.Second
-	gracefulShutdown(servers, grace, logger)
+	for _, rv := range asList(root["routes"]) {
+		rm := asMap(rv)
+		cfg.Routes = append(cfg.Routes, RouteConfig{
+			Match: asString(rm["match"]),
+			Pool:  asString(rm["pool"]),
+		})
+	}
 
+	for _, pv := range asList(root["pools"]) {
+		pm := asMap(pv)
+		pc := PoolConfig{
+			Name:     asString(pm["name"]),
+			Strategy: asString(pm["strategy"]),
+		}
+		for _, bv := range asList(pm["backends"]) {
+			bm := asMap(bv)
+			pc.Backends = append(pc.Backends, BackendConfig{URL: asString(bm["url"])})
+		}
+		hcMap := asMap(pm["health_check"])
+		pc.HealthCheck = HealthCheckConfig{
+			Enabled:            asBool(hcMap["enabled"]),
+			Path:               asString(hcMap["path"]),
+			UnhealthyThreshold: asInt(hcMap["unhealthy_threshold"]),
+			HealthyThreshold:   asInt(hcMap["healthy_threshold"]),
+		}
+		pc.HealthCheck.IntervalDur = parseDurationOr(asString(hcMap["interval"]), 10*time.Second)
+		pc.HealthCheck.TimeoutDur = parseDurationOr(asString(hcMap["timeout"]), 2*time.Second)
+		cfg.Pools = append(cfg.Pools, pc)
+	}
+
+	return cfg, nil
+}
+
+func parseDurationOr(s string, fallback time.Duration) time.Duration {
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
+// ---------------------------------------------------------------------------
+// Minimal YAML-subset tokenizer / parser
+// ---------------------------------------------------------------------------
+
+type yamlLine struct {
+	indent  int
+	content string
+}
+
+func tokenizeYAML(data []byte) []yamlLine {
+	rawLines := strings.Split(string(data), "\n")
+	out := make([]yamlLine, 0, len(rawLines))
+	for _, l := range rawLines {
+		line := strings.TrimRight(l, "\r")
+		trimmed := strings.TrimLeft(line, " ")
+		indent := len(line) - len(trimmed)
+		trimmed = stripYAMLComment(trimmed)
+		trimmed = strings.TrimRight(trimmed, " \t")
+		if trimmed == "" || trimmed == "---" {
+			continue
+		}
+		out = append(out, yamlLine{indent: indent, content: trimmed})
+	}
+	return out
+}
+
+func stripYAMLComment(s string) string {
+	inSingle, inDouble := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case '#':
+			if !inSingle && !inDouble {
+				return strings.TrimRight(s[:i], " ")
+			}
+		}
+	}
+	return s
+}
+
+func findColon(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == ':' && (i+1 >= len(s) || s[i+1] == ' ') {
+			return i
+		}
+	}
+	return -1
+}
+
+func parseScalar(s string) interface{} {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	switch s {
+	case "true":
+		return true
+	case "false":
+		return false
+	case "null", "~", "":
+		return nil
+	}
+	if i, err := strconv.Atoi(s); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f
+	}
+	return s
+}
+
+// parseMap parses a block mapping at the given indent level starting at
+// *pos, advancing *pos past all consumed lines, and returns the resulting
+// map[string]interface{}.
+func parseMap(lines []yamlLine, pos *int, indent int) map[string]interface{} {
+	result := map[string]interface{}{}
+	parseMapInto(lines, pos, indent, result)
+	return result
+}
+
+// parseMapInto parses key/value pairs at the given indent level directly
+// into an existing map (used to support inline-map list items where the
+// first key appears on the "- key: value" line itself).
+func parseMapInto(lines []yamlLine, pos *int, indent int, result map[string]interface{}) {
+	for *pos < len(lines) {
+		line := lines[*pos]
+		if line.indent != indent {
+			break
+		}
+		content := line.content
+		if content == "-" || strings.HasPrefix(content, "- ") {
+			// Not a mapping line at this level; stop.
+			break
+		}
+		colonIdx := findColon(content)
+		if colonIdx == -1 {
+			*pos++
+			continue
+		}
+		key := strings.TrimSpace(content[:colonIdx])
+		rest := strings.TrimSpace(content[colonIdx+1:])
+		*pos++
+		result[key] = parseValue(lines, pos, indent, rest)
+	}
+}
+
+// parseValue resolves the value for a key: either the inline scalar
+// (inlineRest non-empty), or a nested block map/sequence found on
+// subsequent, deeper-indented lines.
+func parseValue(lines []yamlLine, pos *int, parentIndent int, inlineRest string) interface{} {
+	if inlineRest != "" {
+		return parseScalar(inlineRest)
+	}
+	if *pos < len(lines) && lines[*pos].indent > parentIndent {
+		childIndent := lines[*pos].indent
+		if lines[*pos].content == "-" || strings.HasPrefix(lines[*pos].content, "- ") {
+			return parseList(lines, pos, childIndent)
+		}
+		return parseMap(lines, pos, childIndent)
+	}
 	return nil
 }
 
-func buildTLSConfig(cfg *TLSConfig) (*tls.Config, error) {
-	cert, err := tls.X509KeyPair(cfg.CertPEM, cfg.KeyPEM)
+// parseList parses a block sequence at the given indent level starting at
+// *pos, advancing *pos past all consumed lines.
+func parseList(lines []yamlLine, pos *int, indent int) []interface{} {
+	var result []interface{}
+	for *pos < len(lines) {
+		line := lines[*pos]
+		if line.indent != indent {
+			break
+		}
+		content := line.content
+		if content != "-" && !strings.HasPrefix(content, "- ") {
+			break
+		}
+		itemContent := strings.TrimSpace(strings.TrimPrefix(content, "-"))
+		*pos++
+
+		if itemContent == "" {
+			if *pos < len(lines) && lines[*pos].indent > indent {
+				childIndent := lines[*pos].indent
+				if lines[*pos].content == "-" || strings.HasPrefix(lines[*pos].content, "- ") {
+					result = append(result, parseList(lines, pos, childIndent))
+				} else {
+					result = append(result, parseMap(lines, pos, childIndent))
+				}
+			} else {
+				result = append(result, nil)
+			}
+			continue
+		}
+
+		colonIdx := findColon(itemContent)
+		if colonIdx == -1 {
+			result = append(result, parseScalar(itemContent))
+			continue
+		}
+
+		// Inline map item: "- key: value" possibly followed by additional
+		// keys at indent+2 on subsequent lines.
+		m := map[string]interface{}{}
+		key := strings.TrimSpace(itemContent[:colonIdx])
+		rest := strings.TrimSpace(itemContent[colonIdx+1:])
+		m[key] = parseValue(lines, pos, indent, rest)
+		parseMapInto(lines, pos, indent+2, m)
+		result = append(result, m)
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// Typed accessors over parsed interface{} values
+// ---------------------------------------------------------------------------
+
+func asMap(v interface{}) map[string]interface{} {
+	if m, ok := v.(map[string]interface{}); ok {
+		return m
+	}
+	return map[string]interface{}{}
+}
+
+func asList(v interface{}) []interface{} {
+	if l, ok := v.([]interface{}); ok {
+		return l
+	}
+	return nil
+}
+
+func asString(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case int:
+		return strconv.Itoa(t)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+func asBool(v interface{}) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		if b, err := strconv.ParseBool(t); err == nil {
+			return b
+		}
+	}
+	return false
+}
+
+func asInt(v interface{}) int {
+	switch t := v.(type) {
+	case int:
+		return t
+	case float64:
+		return int(t)
+	case string:
+		if i, err := strconv.Atoi(t); err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+// ===========================================================================
+// Balancer: Backend / Pool state, Strategy implementations, health checks
+// ===========================================================================
+
+// Backend represents one upstream target and its live health state.
+type Backend struct {
+	URL *url.URL
+
+	Alive       atomic.Bool
+	ActiveConns atomic.Int64
+
+	consecFails     atomic.Int32
+	consecSuccesses atomic.Int32
+}
+
+func newBackend(rawURL string) (*Backend, error) {
+	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("load x509 keypair: %w", err)
+		return nil, fmt.Errorf("parse backend url %q: %w", rawURL, err)
+	}
+	b := &Backend{URL: u}
+	b.Alive.Store(true) // starts alive so it can serve traffic immediately
+	return b, nil
+}
+
+// Strategy selects the next backend to use from a set of candidates.
+type Strategy interface {
+	Next(backends []*Backend) (*Backend, error)
+}
+
+func aliveBackends(backends []*Backend) []*Backend {
+	out := make([]*Backend, 0, len(backends))
+	for _, b := range backends {
+		if b.Alive.Load() {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// RoundRobinStrategy cycles through healthy backends in order using an
+// atomic counter.
+type RoundRobinStrategy struct {
+	cursor atomic.Uint64
+}
+
+func (s *RoundRobinStrategy) Next(backends []*Backend) (*Backend, error) {
+	alive := aliveBackends(backends)
+	if len(alive) == 0 {
+		return nil, ErrNoHealthyBackends
+	}
+	idx := s.cursor.Add(1) - 1
+	return alive[idx%uint64(len(alive))], nil
+}
+
+// LeastConnStrategy selects the healthy backend with the fewest current
+// in-flight requests; ties broken by first-seen order.
+type LeastConnStrategy struct{}
+
+func (s *LeastConnStrategy) Next(backends []*Backend) (*Backend, error) {
+	alive := aliveBackends(backends)
+	if len(alive) == 0 {
+		return nil, ErrNoHealthyBackends
+	}
+	best := alive[0]
+	bestConns := best.ActiveConns.Load()
+	for _, b := range alive[1:] {
+		c := b.ActiveConns.Load()
+		if c < bestConns {
+			best = b
+			bestConns = c
+		}
+	}
+	return best, nil
+}
+
+// RandomStrategy selects a uniformly random healthy backend.
+type RandomStrategy struct {
+	counter atomic.Uint64
+}
+
+func (s *RandomStrategy) Next(backends []*Backend) (*Backend, error) {
+	alive := aliveBackends(backends)
+	if len(alive) == 0 {
+		return nil, ErrNoHealthyBackends
+	}
+	// Simple, dependency-free pseudo-randomness: time-seeded atomic
+	// counter mixed with wall-clock nanoseconds. Sufficient for LB
+	// distribution purposes; not used for any security-sensitive purpose.
+	n := s.counter.Add(1)
+	mix := uint64(time.Now().UnixNano()) ^ n
+	return alive[mix%uint64(len(alive))], nil
+}
+
+func newStrategy(name string) Strategy {
+	switch name {
+	case "least_connections":
+		return &LeastConnStrategy{}
+	case "random":
+		return &RandomStrategy{}
+	default:
+		return &RoundRobinStrategy{}
+	}
+}
+
+// Pool groups backends under one strategy and health-check policy.
+type Pool struct {
+	Name        string
+	Backends    []*Backend
+	Strategy    Strategy
+	HealthCheck HealthCheckConfig
+}
+
+// NewPool constructs a Pool from PoolConfig, resolving Strategy by name.
+func NewPool(cfg PoolConfig) (*Pool, error) {
+	backends := make([]*Backend, 0, len(cfg.Backends))
+	for _, bc := range cfg.Backends {
+		b, err := newBackend(bc.URL)
+		if err != nil {
+			return nil, err
+		}
+		backends = append(backends, b)
 	}
 
-	var minVer uint16 = tls.VersionTLS12
-	if cfg.MinVersion == "1.3" {
-		minVer = tls.VersionTLS13
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   minVer,
+	return &Pool{
+		Name:        cfg.Name,
+		Backends:    backends,
+		Strategy:    newStrategy(cfg.Strategy),
+		HealthCheck: cfg.HealthCheck,
 	}, nil
 }
 
-func gracefulShutdown(servers []*http.Server, grace time.Duration, logger *log.Logger) {
-	ctx, cancel := context.WithTimeout(context.Background(), grace)
-	defer cancel()
+// HealthCheckEnabled reports whether active health checking is configured
+// for this pool.
+func (p *Pool) HealthCheckEnabled() bool {
+	return p.HealthCheck.Enabled
+}
 
-	for _, s := range servers {
-		if err := s.Shutdown(ctx); err != nil {
-			logger.Printf("ERROR graceful shutdown error: %v", err)
+// Choose returns the next healthy backend per the pool's strategy.
+func (p *Pool) Choose() (*Backend, error) {
+	return p.Strategy.Next(p.Backends)
+}
+
+// MarkFailure implements passive circuit-breaker-lite behavior.
+func (p *Pool) MarkFailure(b *Backend) {
+	if b == nil {
+		return
+	}
+	b.consecSuccesses.Store(0)
+	fails := b.consecFails.Add(1)
+	threshold := int32(p.HealthCheck.UnhealthyThreshold)
+	if threshold <= 0 {
+		threshold = 3
+	}
+	if fails >= threshold {
+		b.Alive.Store(false)
+	}
+}
+
+// MarkSuccess resets passive failure counters on a successful proxied response.
+func (p *Pool) MarkSuccess(b *Backend) {
+	if b == nil {
+		return
+	}
+	b.consecFails.Store(0)
+	successes := b.consecSuccesses.Add(1)
+	threshold := int32(p.HealthCheck.HealthyThreshold)
+	if threshold <= 0 {
+		threshold = 2
+	}
+	if successes >= threshold {
+		b.Alive.Store(true)
+	}
+}
+
+// newHealthCheckClient returns a hardened HTTP client used exclusively for
+// active health probing: it does not follow redirects, and enforces a
+// minimum TLS version for HTTPS backend targets.
+func newHealthCheckClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		},
+	}
+}
+
+// joinPath joins a backend base path with a configured health-check path.
+// An empty extra returns base unchanged; an absolute (leading "/") extra
+// overrides base entirely; otherwise the two are joined with exactly one
+// separating slash.
+func joinPath(base, extra string) string {
+	if extra == "" {
+		return base
+	}
+	if strings.HasPrefix(extra, "/") {
+		return extra
+	}
+	if base == "" {
+		return "/" + extra
+	}
+	if strings.HasSuffix(base, "/") {
+		return base + extra
+	}
+	return base + "/" + extra
+}
+
+// RunHealthChecks runs the active health-check probe loop for this pool
+// until ctx is canceled. It probes every backend once immediately, then on
+// each tick of the configured interval.
+func (p *Pool) RunHealthChecks(ctx context.Context, logger *log.Logger) {
+	interval := p.HealthCheck.IntervalDur
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	path := p.HealthCheck.Path
+	if path == "" {
+		path = "/healthz"
+	}
+	client := newHealthCheckClient(p.HealthCheck.TimeoutDur)
+
+	probe := func() {
+		for _, b := range p.Backends {
+			target := *b.URL
+			target.Path = joinPath(target.Path, path)
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+			if err != nil {
+				if logger != nil {
+					logger.Printf("ERROR health check request build failed: pool=%s backend=%s err=%v", p.Name, b.URL.Host, err)
+				}
+				p.MarkFailure(b)
+				continue
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				p.MarkFailure(b)
+				continue
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+				p.MarkSuccess(b)
+			} else {
+				p.MarkFailure(b)
+			}
+		}
+	}
+
+	probe()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probe()
 		}
 	}
 }
+
+// ===========================================================================
+// Metrics: minimal in-process counter/gauge registry
+// ===========================================================================
+
+// Metrics is a small, thread-safe collection of named counters and gauges,
+// each optionally keyed by a label set, rendered in Prometheus text
+// exposition format by WriteTo.
+type Metrics struct {
+	mu       sync.Mutex
+	counters map[string]float64
+	gauges   map[string]float64
+}
+
+// NewMetrics constructs an empty Metrics registry.
+func NewMetrics() *Metrics {
+	return &Metrics{
+		counters: make(map[string]float64),
+		gauges:   make(map[string]float64),
+	}
+}
+
+// metricKey builds a stable series key from a metric name and label set.
+func metricKey(name string, labels map[string]string) string {
+	if len(labels) == 0 {
+		return name
+	}
+	keys := make([]string,
