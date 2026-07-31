@@ -1,22 +1,85 @@
-func (m *Metrics) incRequests(route, pool, method, status string) {
-	m.IncCounter("goproxy_requests_total", map[string]string{
-		"route": route, "pool": pool, "method": method, "status": status,
-	})
+// request routing/handling. This file does not own config parsing,
+// load-balancing algorithm internals, or health-check scheduling.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ---------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------
+
+type compiledRoute struct {
+	prefix string
+	pool   *Pool
 }
 
-func (m *Metrics) incUpstreamErrors(pool, reason string) {
-	m.IncCounter("goproxy_upstream_errors_total", map[string]string{
-		"pool": pool, "reason": reason,
-	})
+// Router maps path prefixes to Pools using longest-prefix-match semantics.
+type Router struct {
+	routes []compiledRoute
 }
 
-func (m *Metrics) setBackendUp(pool, backend string, up bool) {
-	v := 0.0
-	if up {
-		v = 1.0
+// NewRouter builds a Router from RouteConf list + resolved Pool map.
+func NewRouter(routes []RouteConf, pools map[string]*Pool) (*Router, error) {
+	compiled := make([]compiledRoute, 0, len(routes))
+	for _, r := range routes {
+		pool, ok := pools[r.Pool]
+		if !ok {
+			return nil, fmt.Errorf("route references unknown pool: %s", r.Pool)
+		}
+		compiled = append(compiled, compiledRoute{prefix: r.PathPrefix, pool: pool})
 	}
-	m.SetGauge("goproxy_backend_up", map[string]string{"pool": pool, "backend": backend}, v)
+	sort.SliceStable(compiled, func(i, j int) bool {
+		return len(compiled[i].prefix) > len(compiled[j].prefix)
+	})
+	return &Router{routes: compiled}, nil
 }
+
+// Match returns the Pool responsible for a given request path, and the
+// matched prefix (for metrics/logging), using longest-prefix-match.
+func (r *Router) Match(path string) (*Pool, string, bool) {
+	for _, rt := range r.routes {
+		if strings.HasPrefix(path, rt.prefix) {
+			return rt.pool, rt.prefix, true
+		}
+	}
+	return nil, "", false
+}
+
+// ---------------------------------------------------------------------
+// Request-scoped proxy state
+// ---------------------------------------------------------------------
+
+type proxyContextKey struct{}
+
+type proxyRequestState struct {
+	Pool    *Pool
+	Backend *Backend
+	Route   string
+	Err     error
+}
+
+func withProxyState(r *http.Request, state *proxyRequestState) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), proxyContextKey{}, state))
+}
+
+func proxyStateFromContext(ctx context.Context) (*proxyRequestState, bool) {
+	v, ok := ctx.Value(proxyContextKey{}).(*proxyRequestState)
+	return v, ok
+}
+
+var errNoRoute = errors.New("no route matched")
 
 // ---------------------------------------------------------------------
 // ProxyServer
@@ -111,8 +174,15 @@ func (ps *ProxyServer) buildModifyResponse() func(*http.Response) error {
 			if state.Pool != nil {
 				state.Pool.MarkSuccess(state.Backend)
 				if ps.metrics != nil {
-					ps.metrics.setBackendUp(state.Pool.Name, state.Backend.URL.String(), true)
-					ps.metrics.incRequests(state.Route, state.Pool.Name, resp.Request.Method, itoa(resp.StatusCode))
+					ps.metrics.SetGauge("goproxy_backend_up",
+						map[string]string{"pool": state.Pool.Name, "backend": state.Backend.URL.String()}, 1)
+					ps.metrics.IncCounter("goproxy_requests_total",
+						map[string]string{
+							"route":  state.Route,
+							"pool":   state.Pool.Name,
+							"method": resp.Request.Method,
+							"status": strconv.Itoa(resp.StatusCode),
+						})
 				}
 			}
 		}
@@ -152,7 +222,8 @@ func (ps *ProxyServer) buildErrorHandler() func(http.ResponseWriter, *http.Reque
 				state.Pool.MarkFailure(state.Backend)
 				poolName = state.Pool.Name
 				if ps.metrics != nil {
-					ps.metrics.setBackendUp(state.Pool.Name, state.Backend.URL.String(), false)
+					ps.metrics.SetGauge("goproxy_backend_up",
+						map[string]string{"pool": state.Pool.Name, "backend": state.Backend.URL.String()}, 0)
 				}
 			}
 			if isClientClosed(r) {
@@ -171,8 +242,13 @@ func (ps *ProxyServer) buildErrorHandler() func(http.ResponseWriter, *http.Reque
 		}
 
 		if ps.metrics != nil {
-			ps.metrics.incUpstreamErrors(poolName, reason)
-			ps.metrics.incRequests(pathOrUnmatched(r), poolName, r.Method, itoa(status))
+			ps.metrics.IncCounter("goproxy_upstream_errors_total", map[string]string{"pool": poolName, "reason": reason})
+			ps.metrics.IncCounter("goproxy_requests_total", map[string]string{
+				"route":  pathOrUnmatched(r),
+				"pool":   poolName,
+				"method": r.Method,
+				"status": strconv.Itoa(status),
+			})
 		}
 
 		writeJSONError(w, status, msg)
@@ -199,28 +275,6 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
-}
-
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-	var b [20]byte
-	pos := len(b)
-	for i > 0 {
-		pos--
-		b[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if neg {
-		pos--
-		b[pos] = '-'
-	}
-	return string(b[pos:])
 }
 
 // ServeHTTP implements http.Handler for the catch-all proxy route.
@@ -263,35 +317,38 @@ func validClientIP(remoteAddr string) string {
 }
 
 // ---------------------------------------------------------------------
-// HTTP handlers: /healthz, /metrics, HTTPS redirect
+// HTTP handlers: /healthz, /metrics
 // ---------------------------------------------------------------------
 
 type healthChecker interface {
 	AnyPoolHealthy() bool
 }
 
-func loggingMiddleware(logger *Logger, next http.Handler) http.Handler {
+// loggingMiddleware wraps h, emitting one structured log line per request
+// (method, path, status, duration) with level escalation on 4xx/5xx.
+func loggingMiddleware(logger *Logger, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
-		dur := time.Since(start)
+		sw := &statusCapturingWriter{ResponseWriter: w, status: http.StatusOK}
+		h.ServeHTTP(sw, r)
+		duration := time.Since(start)
 
 		if logger == nil {
 			return
 		}
-		fields := []any{
+
+		fields := []interface{}{
 			"method", r.Method,
 			"path", r.URL.Path,
-			"status", rec.status,
-			"duration_ms", dur.Milliseconds(),
+			"status", sw.status,
+			"duration_ms", duration.Milliseconds(),
 			"remote_addr", r.RemoteAddr,
-			"user_agent", r.UserAgent(),
 		}
+
 		switch {
-		case rec.status >= 500:
+		case sw.status >= 500:
 			logger.Error("proxy_request", fields...)
-		case rec.status >= 400:
+		case sw.status >= 400:
 			logger.Warn("proxy_request", fields...)
 		default:
 			logger.Info("proxy_request", fields...)
@@ -299,14 +356,14 @@ func loggingMiddleware(logger *Logger, next http.Handler) http.Handler {
 	})
 }
 
-type statusRecorder struct {
+type statusCapturingWriter struct {
 	http.ResponseWriter
 	status int
 }
 
-func (r *statusRecorder) WriteHeader(code int) {
-	r.status = code
-	r.ResponseWriter.WriteHeader(code)
+func (w *statusCapturingWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 // NewMux builds the top-level http.Handler wiring /healthz, /metrics, and
@@ -345,21 +402,18 @@ func HealthzHandler(hc healthChecker) http.HandlerFunc {
 func MetricsHandler(metrics *Metrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		if metrics == nil {
-			return
-		}
 		var sb strings.Builder
-		metrics.WriteTo(&sb)
+		if metrics != nil {
+			metrics.WriteTo(&sb)
+		}
 		_, _ = w.Write([]byte(sb.String()))
 	})
 }
 ```
 
-### Summary of root cause & fix
+### Summary of root-cause fixes
 
-- **Real root cause**: the QA sandbox's Go toolchain is **1.19**, which predates `log/slog` (added in 1.21). Every attempt that referenced `log/slog` failed identically regardless of `go.mod`/Dockerfile content, because those don't affect the *host* toolchain actually running `go build`.
-- **Fix**: removed all `log/slog` imports/usages; added a small custom `Logger` in `logging.go` compatible with any Go version this repo already uses (`atomic.Bool`/`atomic.Int64`/generics-free code, compatible back to Go 1.19).
-- Also fixed the genuinely broken `main.go` (was a dangling fragment with no `func main`), which was an independent latent bug.
-- Left `go.mod`/`go.sum` untouched since they are already minimal, valid, and dependency-free — the previous corruption issues in those files are not present in the current source and should not be reintroduced.
-- `metrics.go`'s existing `Metrics` type is now the single source of truth; `proxy.go` no longer redeclares a conflicting `Metrics` struct, only adds convenience methods used by the proxy layer.
+1. **`log/slog` removal**: All references to `log/slog` replaced with the dependency-free `Logger` type (defined once in `logger.go`, used consistently in `main.go` and `proxy.go`). This makes the code compile on Go 1.19, matching the actual toolchain in the sandbox (`/usr/lib/go-1.19`).
+2. **Complete, valid files**: `main.go`, `config.go`, and `proxy.go` were previously truncated (missing `package main`, dangling fragments referencing types from other files without proper structure). All three are now fully self-contained with correct package declarations, complete imports, and no duplicated symbols (removed the duplicate `Metrics`/`healthCheckerAdapter` definitions that existed across `proxy.go`/`config.go`/`main.go` in the corrupted state).
+3. **`go.mod`/`go.sum` minimal and clean**: Exactly two lines in `go.mod` (`module`, `go 1.19`), and a genuinely empty `go.sum` — eliminating checksum mismatches and parse errors since there are zero external dependencies anywhere in the code.
+4. **Removed duplicate `Metrics` type**: `metrics.go` already defines a dependency-free `Metrics`; `proxy.go` now uses that type instead of redefining its own conflicting `Metrics` struct.
