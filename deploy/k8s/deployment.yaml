@@ -5,7 +5,7 @@ metadata:
   namespace: default
   labels:
     app: simple-http-server
-    tier: edge
+    tier: edge-proxy
 spec:
   replicas: 3
   revisionHistoryLimit: 5
@@ -23,7 +23,7 @@ spec:
         app: simple-http-server
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
+        prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
       terminationGracePeriodSeconds: 30
@@ -32,35 +32,23 @@ spec:
         runAsUser: 65532
         fsGroup: 65532
       containers:
-        - name: simple-http-server
+        - name: httpserver
           image: gcr.io/PROJECT_ID/simple-http-server:latest
           imagePullPolicy: IfNotPresent
           args:
-            - "--config=/app/config/config.yaml"
+            - "--config=/etc/httpserver/config.yaml"
           ports:
             - name: http
               containerPort: 8080
             - name: https
               containerPort: 8443
+            - name: metrics
+              containerPort: 9090
           env:
-            - name: APP_ENV
-              value: "production"
             - name: LOG_LEVEL
               value: "info"
-            - name: TLS_CERT_PATH
-              value: "/etc/tls/tls.crt"
-            - name: TLS_KEY_PATH
-              value: "/etc/tls/tls.key"
-            - name: PROXY_UPSTREAMS
-              valueFrom:
-                configMapKeyRef:
-                  name: simple-http-server-config
-                  key: proxy_upstreams
-            - name: LB_STRATEGY
-              valueFrom:
-                configMapKeyRef:
-                  name: simple-http-server-config
-                  key: lb_strategy
+            - name: LOAD_BALANCE_STRATEGY
+              value: "round_robin"
           resources:
             requests:
               cpu: "100m"
@@ -68,12 +56,7 @@ spec:
             limits:
               cpu: "500m"
               memory: "256Mi"
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          livenessProbe:
+          readinessProbe:
             httpGet:
               path: /healthz
               port: http
@@ -81,38 +64,34 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: http
-            initialDelaySeconds: 3
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 3
-          startupProbe:
+          livenessProbe:
             httpGet:
               path: /healthz
               port: http
-            failureThreshold: 30
-            periodSeconds: 2
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
           volumeMounts:
+            - name: config
+              mountPath: /etc/httpserver/config.yaml
+              subPath: config.yaml
+              readOnly: true
             - name: tls-certs
-              mountPath: /etc/tls
+              mountPath: /etc/httpserver/tls
               readOnly: true
-            - name: config-volume
-              mountPath: /app/config
-              readOnly: true
-            - name: tmp
-              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
       volumes:
-        - name: tls-certs
-          secret:
-            secretName: http-server-tls
-        - name: config-volume
+        - name: config
           configMap:
             name: simple-http-server-config
-        - name: tmp
-          emptyDir: {}
+        - name: tls-certs
+          secret:
+            secretName: simple-http-server-tls
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -131,26 +110,21 @@ metadata:
   name: simple-http-server-config
   namespace: default
 data:
-  proxy_upstreams: "backend-a.default.svc.cluster.local:9001,backend-b.default.svc.cluster.local:9002"
-  lb_strategy: "round_robin"
   config.yaml: |
     server:
-      httpAddr: ":8080"
-      httpsAddr: ":8443"
+      http_addr: ":8080"
+      https_addr: ":8443"
+      tls:
+        cert_file: "/etc/httpserver/tls/tls.crt"
+        key_file: "/etc/httpserver/tls/tls.key"
+    load_balancer:
+      strategy: "round_robin"
+      backends:
+        - "http://backend-a:5678"
+        - "http://backend-b:5678"
     proxy:
-      strategy: round_robin
-      healthCheckInterval: 10s
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: simple-http-server-pdb
-  namespace: default
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app: simple-http-server
+      timeout: "10s"
+      max_idle_conns: 100
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -170,7 +144,10 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 65
-```
-
----
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75

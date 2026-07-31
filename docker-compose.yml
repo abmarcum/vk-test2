@@ -1,55 +1,51 @@
 version: "3.9"
 
 services:
-  http-server:
+  httpserver:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VERSION: "0.1.0"
+        COMMIT_SHA: "local"
     image: simple-http-server:local
     container_name: simple-http-server
     restart: unless-stopped
     ports:
       - "8080:8080"   # HTTP
-      - "8443:8443"   # HTTPS
-    environment:
-      - APP_ENV=development
-      - LOG_LEVEL=info
-      - TLS_CERT_PATH=/etc/certs/tls.crt
-      - TLS_KEY_PATH=/etc/certs/tls.key
-      - PROXY_UPSTREAMS=backend-a:9001,backend-b:9002
-      - LB_STRATEGY=round_robin
+      - "8443:8443"   # HTTPS / SSL termination
     volumes:
-      - ./config:/app/config:ro
-      - ./certs:/etc/certs:ro
-    networks:
-      - httpnet
-    depends_on:
-      - backend-a
-      - backend-b
+      - ./configs/config.yaml:/etc/httpserver/config.yaml:ro
+      - ./certs:/etc/httpserver/tls:ro
+    environment:
+      - LOG_LEVEL=info
+      - LOAD_BALANCE_STRATEGY=round_robin
     healthcheck:
-      test: ["CMD", "/app/simple-http-server", "--healthcheck"]
+      test: ["CMD", "/app/httpserver", "--healthcheck"]
       interval: 15s
       timeout: 3s
       retries: 3
       start_period: 5s
+    networks:
+      - httpserver-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
 
   backend-a:
     image: hashicorp/http-echo:1.0
-    command: ["-text=response from backend-a", "-listen=:9001"]
-    container_name: backend-a
+    command: ["-text=backend-a", "-listen=:5678"]
     networks:
-      - httpnet
+      - httpserver-net
 
   backend-b:
     image: hashicorp/http-echo:1.0
-    command: ["-text=response from backend-b", "-listen=:9002"]
-    container_name: backend-b
+    command: ["-text=backend-b", "-listen=:5678"]
     networks:
-      - httpnet
+      - httpserver-net
 
 networks:
-  httpnet:
+  httpserver-net:
     driver: bridge
-```
-
----
