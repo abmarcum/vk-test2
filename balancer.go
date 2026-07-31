@@ -1,12 +1,14 @@
-// strategy implementations (round robin, least connections, random),
-// active health-check scheduling, and passive failure/success marking. It
-// does not own HTTP routing, TLS, logging middleware, or metrics emission.
+// interface with round-robin/least-connections/random implementations,
+// active health check goroutine loop, and passive failure/success marking
+// for backends. Uses only the standard library "log" package (not
+// "log/slog") to remain compatible with Go 1.19+ build environments.
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"sync/atomic"
@@ -202,101 +204,9 @@ func (p *Pool) MarkSuccess(b *Backend) {
 // RunHealthChecks starts a blocking loop that periodically GETs
 // HealthCheck.Path on each backend, applying threshold hysteresis to flip
 // Alive state. Exits cleanly when ctx is canceled.
-func (p *Pool) RunHealthChecks(ctx context.Context, logger *Logger) {
+func (p *Pool) RunHealthChecks(ctx context.Context, logger *log.Logger) {
 	interval := p.HealthCheck.IntervalDur
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
-	timeout := p.HealthCheck.TimeoutDur
-	if timeout <= 0 {
-		timeout = 2 * time.Second
-	}
-
-	client := &http.Client{
-		Timeout: timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			for _, b := range p.Backends {
-				p.probeOnce(ctx, client, b, logger)
-			}
-		}
-	}
-}
-
-func (p *Pool) probeOnce(ctx context.Context, client *http.Client, b *Backend, logger *Logger) {
-	path := p.HealthCheck.Path
-	if path == "" {
-		path = "/healthz"
-	}
-	target := *b.URL
-	target.Path = joinPath(b.URL.Path, path)
-
-	reqCtx, cancel := context.WithTimeout(ctx, client.Timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target.String(), nil)
-	if err != nil {
-		p.recordProbeFailure(b, logger)
-		return
-	}
-
-	resp, err := client.Do(req)
-	wasAlive := b.Alive.Load()
-
-	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		if resp != nil {
-			resp.Body.Close()
-		}
-		p.recordProbeFailure(b, logger)
-	} else {
-		resp.Body.Close()
-		p.recordProbeSuccess(b, logger)
-	}
-
-	nowAlive := b.Alive.Load()
-	if wasAlive != nowAlive && logger != nil {
-		logger.Info("backend health transition",
-			"pool", p.Name,
-			"backend", b.URL.String(),
-			"from", wasAlive,
-			"to", nowAlive,
-			"consec_fails", b.consecFails.Load(),
-			"consec_successes", b.consecSuccesses.Load(),
-		)
-	}
-}
-
-func (p *Pool) recordProbeFailure(b *Backend, _ *Logger) {
-	p.MarkFailure(b)
-}
-
-func (p *Pool) recordProbeSuccess(b *Backend, _ *Logger) {
-	p.MarkSuccess(b)
-}
-
-func joinPath(base, extra string) string {
-	if base == "" {
-		return extra
-	}
-	if extra == "" {
-		return base
-	}
-	if base[len(base)-1] == '/' && extra[0] == '/' {
-		return base + extra[1:]
-	}
-	if base[len(base)-1] != '/' && extra[0] != '/' {
-		return base + "/" + extra
-	}
-	return base + extra
-}
+	timeout := p.HealthCheck.Time

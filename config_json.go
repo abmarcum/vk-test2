@@ -1,9 +1,8 @@
-// decoder used by config.go. A hand-rolled JSON parse via encoding/json
-// is used instead of a third-party YAML library to keep the module's
-// dependency graph at zero external packages, entirely avoiding module
-// resolution failures. Config files may be authored as JSON;
-// operators who prefer YAML can convert with any standard tool prior to
-// deployment.
+// parse via encoding/json is used instead of a third-party YAML library to
+// keep the module's dependency graph at zero external packages, entirely
+// avoiding module resolution failures. Config files may be authored as
+// JSON; operators who prefer YAML can convert with any standard tool prior
+// to deployment.
 package main
 
 import (

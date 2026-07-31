@@ -1,221 +1,164 @@
 // Director/ModifyResponse/ErrorHandler hooks, request-scoped proxy state
-// propagation, structured logging and metrics middleware, an in-process
-// metrics registry, healthz/metrics HTTP handlers, and the HTTPS redirect
-// handler. It does not own config parsing, load-balancing algorithm
-// internals, or health-check scheduling.
+// propagation, structured logging and metrics middleware, healthz/metrics
+// HTTP handlers. Uses only the standard library "log" package (not
+// "log/slog") to remain compatible with Go 1.19+ build environments.
 package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"log/slog"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Router
-// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
-type compiledRoute struct {
+type routeEntry struct {
 	prefix string
 	pool   *Pool
 }
 
-// Router maps path prefixes to Pools using longest-prefix-match semantics.
+// Router resolves an incoming request path to a Pool using longest-prefix
+// match, independent of declaration order.
 type Router struct {
-	routes []compiledRoute
+	entries []routeEntry
 }
 
-// NewRouter builds a Router from RouteConf list + resolved Pool map.
-func NewRouter(routes []RouteConf, pools map[string]*Pool) (*Router, error) {
-	compiled := make([]compiledRoute, 0, len(routes))
+// NewRouter builds a Router from route configs and the resolved pool map.
+func NewRouter(routes []Route, pools map[string]*Pool) (*Router, error) {
+	entries := make([]routeEntry, 0, len(routes))
 	for _, r := range routes {
-		pool, ok := pools[r.Pool]
+		p, ok := pools[r.Pool]
 		if !ok {
-			return nil, fmt.Errorf("route references unknown pool: %s", r.Pool)
+			return nil, fmt.Errorf("route %q references unknown pool %q", r.PathPrefix, r.Pool)
 		}
-		compiled = append(compiled, compiledRoute{prefix: r.PathPrefix, pool: pool})
+		entries = append(entries, routeEntry{prefix: r.PathPrefix, pool: p})
 	}
-	sort.SliceStable(compiled, func(i, j int) bool {
-		return len(compiled[i].prefix) > len(compiled[j].prefix)
+	sort.Slice(entries, func(i, j int) bool {
+		return len(entries[i].prefix) > len(entries[j].prefix)
 	})
-	return &Router{routes: compiled}, nil
+	return &Router{entries: entries}, nil
 }
 
-// Match returns the Pool responsible for a given request path, and the
-// matched prefix (for metrics/logging), using longest-prefix-match.
-func (r *Router) Match(path string) (*Pool, string, bool) {
-	for _, rt := range r.routes {
-		if strings.HasPrefix(path, rt.prefix) {
-			return rt.pool, rt.prefix, true
+// Match returns the pool and matched prefix for path, or ok=false if none matches.
+func (r *Router) Match(path string) (pool *Pool, prefix string, ok bool) {
+	for _, e := range r.entries {
+		if strings.HasPrefix(path, e.prefix) {
+			return e.pool, e.prefix, true
 		}
 	}
 	return nil, "", false
 }
 
-// ---------------------------------------------------------------------
-// Request-scoped proxy state
-// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// healthChecker interface + /healthz, /metrics handlers
+// ---------------------------------------------------------------------------
 
-type proxyContextKey struct{}
-
-type proxyRequestState struct {
-	Pool    *Pool
-	Backend *Backend
-	Route   string
-	Err     error
+type healthChecker interface {
+	AnyPoolHealthy() bool
 }
 
-func withProxyState(r *http.Request, state *proxyRequestState) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), proxyContextKey{}, state))
-}
+// NewMux wires /healthz, /metrics, and the catch-all proxy handler.
+func NewMux(proxyServer *ProxyServer, metrics *Metrics, hc healthChecker, logger *log.Logger) http.Handler {
+	mux := http.NewServeMux()
 
-func proxyStateFromContext(ctx context.Context) (*proxyRequestState, bool) {
-	v, ok := ctx.Value(proxyContextKey{}).(*proxyRequestState)
-	return v, ok
-}
-
-var errNoRoute = errors.New("no route matched")
-
-// ---------------------------------------------------------------------
-// Metrics (dependency-free, in-process counters exposed as Prometheus
-// exposition-format text on /metrics; no third-party client library).
-// ---------------------------------------------------------------------
-
-type counterKey string
-
-// Metrics bundles simple in-process counters/gauges keyed by label tuples.
-type Metrics struct {
-	mu             sync.Mutex
-	requestsTotal  map[counterKey]int64
-	upstreamErrors map[counterKey]int64
-	backendUp      map[counterKey]float64
-	inFlight       map[counterKey]int64
-	durationCount  map[counterKey]int64
-	durationSumMs  map[counterKey]int64
-}
-
-// NewMetrics constructs a fresh, empty metrics registry.
-func NewMetrics() *Metrics {
-	return &Metrics{
-		requestsTotal:  make(map[counterKey]int64),
-		upstreamErrors: make(map[counterKey]int64),
-		backendUp:      make(map[counterKey]float64),
-		inFlight:       make(map[counterKey]int64),
-		durationCount:  make(map[counterKey]int64),
-		durationSumMs:  make(map[counterKey]int64),
-	}
-}
-
-func (m *Metrics) incRequests(route, pool, method, status string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	k := counterKey(route + "|" + pool + "|" + method + "|" + status)
-	m.requestsTotal[k]++
-}
-
-func (m *Metrics) incUpstreamErrors(pool, reason string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	k := counterKey(pool + "|" + reason)
-	m.upstreamErrors[k]++
-}
-
-func (m *Metrics) setBackendUp(pool, backend string, up bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	k := counterKey(pool + "|" + backend)
-	if up {
-		m.backendUp[k] = 1
-	} else {
-		m.backendUp[k] = 0
-	}
-}
-
-func (m *Metrics) observeDuration(route, pool, method string, d time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	k := counterKey(route + "|" + pool + "|" + method)
-	m.durationCount[k]++
-	m.durationSumMs[k] += d.Milliseconds()
-}
-
-// render produces a minimal Prometheus text-exposition-format snapshot.
-func (m *Metrics) render() []byte {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var b strings.Builder
-	b.WriteString("# HELP goproxy_requests_total Total proxied requests by outcome.\n")
-	b.WriteString("# TYPE goproxy_requests_total counter\n")
-	for k, v := range m.requestsTotal {
-		parts := strings.SplitN(string(k), "|", 4)
-		fmt.Fprintf(&b, "goproxy_requests_total{route=%q,pool=%q,method=%q,status=%q} %d\n",
-			parts[0], parts[1], parts[2], parts[3], v)
-	}
-
-	b.WriteString("# HELP goproxy_upstream_errors_total Count of proxy-side error outcomes.\n")
-	b.WriteString("# TYPE goproxy_upstream_errors_total counter\n")
-	for k, v := range m.upstreamErrors {
-		parts := strings.SplitN(string(k), "|", 2)
-		fmt.Fprintf(&b, "goproxy_upstream_errors_total{pool=%q,reason=%q} %d\n", parts[0], parts[1], v)
-	}
-
-	b.WriteString("# HELP goproxy_backend_up 1 if backend is healthy, 0 otherwise.\n")
-	b.WriteString("# TYPE goproxy_backend_up gauge\n")
-	for k, v := range m.backendUp {
-		parts := strings.SplitN(string(k), "|", 2)
-		fmt.Fprintf(&b, "goproxy_backend_up{pool=%q,backend=%q} %g\n", parts[0], parts[1], v)
-	}
-
-	b.WriteString("# HELP goproxy_request_duration_seconds_avg Average request latency.\n")
-	b.WriteString("# TYPE goproxy_request_duration_seconds_avg gauge\n")
-	for k, count := range m.durationCount {
-		parts := strings.SplitN(string(k), "|", 3)
-		sum := m.durationSumMs[k]
-		avgSec := 0.0
-		if count > 0 {
-			avgSec = (float64(sum) / float64(count)) / 1000.0
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet && req.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
-		fmt.Fprintf(&b, "goproxy_request_duration_seconds_avg{route=%q,pool=%q,method=%q} %g\n",
-			parts[0], parts[1], parts[2], avgSec)
-	}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		if hc.AnyPoolHealthy() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"unhealthy"}`))
+		}
+	})
 
-	return []byte(b.String())
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		var sb strings.Builder
+		metrics.WriteTo(&sb)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = w.Write([]byte(sb.String()))
+	})
+
+	mux.Handle("/", LoggingRecoverMiddleware(proxyServer, logger))
+
+	return mux
 }
 
-// ---------------------------------------------------------------------
-// ProxyServer
-// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Proxy state + ProxyServer
+// ---------------------------------------------------------------------------
 
+type ctxKey int
+
+const proxyStateKey ctxKey = iota
+
+type proxyState struct {
+	route   string
+	pool    string
+	backend string
+	status  int
+	err     error
+	bytes   int64
+	mu      sync.Mutex
+}
+
+func (s *proxyState) setStatus(code int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status = code
+}
+
+func (s *proxyState) setErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+}
+
+func (s *proxyState) addBytes(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bytes += n
+}
+
+func (s *proxyState) snapshot() (route, pool, backend string, status int, bytes int64, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.route, s.pool, s.backend, s.status, s.bytes, s.err
+}
+
+// ProxyServer dispatches requests to the matched pool's chosen backend via
+// httputil.ReverseProxy, recording metrics and structured logs.
 type ProxyServer struct {
 	router  *Router
 	metrics *Metrics
-	logger  *slog.Logger
-	proxy   *httputil.ReverseProxy
+	logger  *log.Logger
+	rp      *httputil.ReverseProxy
+	dialer  *net.Dialer
 }
 
-// NewProxyServer constructs a ProxyServer with hardened transport, header
-// sanitation, and hooked Director/ModifyResponse/ErrorHandler.
-func NewProxyServer(router *Router, metrics *Metrics, logger *slog.Logger) *ProxyServer {
-	ps := &ProxyServer{router: router, metrics: metrics, logger: logger}
+// NewProxyServer constructs a ProxyServer wired to router and metrics.
+func NewProxyServer(router *Router, metrics *Metrics, logger *log.Logger) *ProxyServer {
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 
 	transport := &http.Transport{
-		Proxy: nil,
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		Proxy:                 nil,
+		DialContext:           dialer.DialContext,
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   50,
 		IdleConnTimeout:       90 * time.Second,
@@ -225,263 +168,260 @@ func NewProxyServer(router *Router, metrics *Metrics, logger *slog.Logger) *Prox
 		ForceAttemptHTTP2:     true,
 	}
 
-	rp := &httputil.ReverseProxy{
-		Transport:      transport,
-		FlushInterval:  100 * time.Millisecond,
-		Director:       ps.buildDirector(),
-		ModifyResponse: ps.buildModifyResponse(),
-		ErrorHandler:   ps.buildErrorHandler(),
+	ps := &ProxyServer{
+		router:  router,
+		metrics: metrics,
+		logger:  logger,
+		dialer:  dialer,
 	}
-	ps.proxy = rp
+
+	rp := &httputil.ReverseProxy{
+		Director:      ps.director,
+		ModifyResponse: ps.modifyResponse,
+		ErrorHandler:  ps.errorHandler,
+		Transport:     transport,
+		FlushInterval: 100 * time.Millisecond,
+	}
+	ps.rp = rp
 	return ps
 }
 
-func (ps *ProxyServer) buildDirector() func(*http.Request) {
-	return func(req *http.Request) {
-		start := time.Now()
-		_ = start
+func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	state := &proxyState{route: "unmatched", pool: "none"}
+	ctx := context.WithValue(req.Context(), proxyStateKey, state)
+	req = req.WithContext(ctx)
 
-		pool, route, ok := ps.router.Match(req.URL.Path)
-		if !ok {
-			state := &proxyRequestState{Route: req.URL.Path, Err: errNoRoute}
-			*req = *withProxyState(req, state)
-			req.URL.Scheme = "http"
-			req.URL.Host = ""
-			return
+	start := time.Now()
+
+	pool, prefix, ok := ps.router.Match(req.URL.Path)
+	if !ok {
+		state.route = "unmatched"
+		state.pool = "none"
+		ps.metrics.IncCounter("goproxy_upstream_errors_total", map[string]string{"pool": "none", "reason": "no_route"})
+		writeJSONError(w, http.StatusNotFound, "not found")
+		ps.logRequest(req, state, start)
+		return
+	}
+	state.route = prefix
+	state.pool = pool.Name
+
+	backend, err := pool.Choose()
+	if err != nil {
+		ps.metrics.IncCounter("goproxy_upstream_errors_total", map[string]string{"pool": pool.Name, "reason": "no_healthy_backend"})
+		writeJSONError(w, http.StatusServiceUnavailable, "service unavailable")
+		ps.logRequest(req, state, start)
+		return
+	}
+	state.backend = backend.URL.String()
+
+	backend.ActiveConns.Add(1)
+	defer backend.ActiveConns.Add(-1)
+
+	labels := map[string]string{"pool": pool.Name}
+	ps.metrics.SetGauge("goproxy_in_flight_requests", labels, float64(backend.ActiveConns.Load()))
+
+	req = req.WithContext(context.WithValue(req.Context(), backendCtxKey, backendRef{pool: pool, backend: backend}))
+
+	rw := &statusCapturingWriter{ResponseWriter: w, status: http.StatusOK}
+	ps.rp.ServeHTTP(rw, req)
+
+	state.setStatus(rw.status)
+	if rw.status < 500 {
+		pool.MarkSuccess(backend)
+	} else {
+		pool.MarkFailure(backend)
+	}
+
+	ps.metrics.IncCounter("goproxy_requests_total", map[string]string{
+		"route": prefix, "pool": pool.Name, "method": req.Method, "status": strconv.Itoa(rw.status),
+	})
+	ps.metrics.SetGauge("goproxy_backend_up", map[string]string{"pool": pool.Name, "backend": backend.URL.String()}, boolToFloat(backend.Alive.Load()))
+
+	ps.logRequest(req, state, start)
+}
+
+type ctxBackendKey int
+
+const backendCtxKey ctxBackendKey = 0
+
+type backendRef struct {
+	pool    *Pool
+	backend *Backend
+}
+
+func (ps *ProxyServer) director(req *http.Request) {
+	ref, ok := req.Context().Value(backendCtxKey).(backendRef)
+	if !ok || ref.backend == nil {
+		return
+	}
+	target := ref.backend.URL
+	req.URL.Scheme = target.Scheme
+	req.URL.Host = target.Host
+	req.Host = target.Host
+
+	stripHopHeaders(req.Header)
+
+	if req.TLS != nil {
+		req.Header.Set("X-Forwarded-Proto", "https")
+	} else if p := req.Header.Get("X-Forwarded-Proto"); p != "http" && p != "https" {
+		req.Header.Set("X-Forwarded-Proto", "http")
+	}
+	req.Header.Set("X-Forwarded-Host", req.Host)
+
+	if ip := clientIP(req.RemoteAddr); ip != "" {
+		if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
+			req.Header.Set("X-Forwarded-For", prior+", "+ip)
+		} else {
+			req.Header.Set("X-Forwarded-For", ip)
 		}
+	}
 
-		backend, err := pool.Choose()
-		if err != nil {
-			state := &proxyRequestState{Pool: pool, Route: route, Err: err}
-			*req = *withProxyState(req, state)
-			req.URL.Scheme = "http"
-			req.URL.Host = ""
-			return
-		}
-
-		backend.ActiveConns.Add(1)
-		state := &proxyRequestState{Pool: pool, Backend: backend, Route: route}
-		*req = *withProxyState(req, state)
-
-		req.URL.Scheme = backend.URL.Scheme
-		req.URL.Host = backend.URL.Host
-		req.Host = backend.URL.Host
-
-		stripHopByHopHeaders(req.Header)
-
-		if req.TLS != nil {
-			req.Header.Set("X-Forwarded-Proto", "https")
-		} else if existing := req.Header.Get("X-Forwarded-Proto"); existing != "http" && existing != "https" {
-			req.Header.Set("X-Forwarded-Proto", "http")
-		}
-		req.Header.Set("X-Forwarded-Host", req.Host)
-		if clientIP := validClientIP(req.RemoteAddr); clientIP != "" {
-			req.Header.Add("X-Forwarded-For", clientIP)
-		}
-		req.Header.Set("X-Forwarded-For-Pool", pool.Name)
+	if ref.pool != nil {
+		req.Header.Set("X-Forwarded-For-Pool", ref.pool.Name)
 	}
 }
 
-func (ps *ProxyServer) buildModifyResponse() func(*http.Response) error {
-	return func(resp *http.Response) error {
-		state, ok := proxyStateFromContext(resp.Request.Context())
-		if ok && state != nil && state.Backend != nil {
-			state.Backend.ActiveConns.Add(-1)
-			if state.Pool != nil {
-				state.Pool.MarkSuccess(state.Backend)
-				if ps.metrics != nil {
-					ps.metrics.setBackendUp(state.Pool.Name, state.Backend.URL.String(), true)
-					ps.metrics.incRequests(state.Route, state.Pool.Name, resp.Request.Method, itoa(resp.StatusCode))
-				}
-			}
-		}
+func (ps *ProxyServer) modifyResponse(resp *http.Response) error {
+	stripHopHeaders(resp.Header)
+	resp.Header.Del("Server")
+	resp.Header.Del("X-Powered-By")
+	resp.Header.Set("X-Content-Type-Options", "nosniff")
 
-		stripHopByHopHeaders(resp.Header)
-		resp.Header.Del("Server")
-		resp.Header.Del("X-Powered-By")
-		resp.Header.Set("X-Content-Type-Options", "nosniff")
-		return nil
+	if state, ok := resp.Request.Context().Value(proxyStateKey).(*proxyState); ok {
+		if resp.ContentLength > 0 {
+			state.addBytes(resp.ContentLength)
+		}
+	}
+	return nil
+}
+
+func (ps *ProxyServer) errorHandler(w http.ResponseWriter, req *http.Request, err error) {
+	state, _ := req.Context().Value(proxyStateKey).(*proxyState)
+	if state != nil {
+		state.setErr(err)
+	}
+
+	status := http.StatusBadGateway
+	msg := "bad gateway"
+	reason := "bad_gateway"
+
+	if req.Context().Err() == context.Canceled {
+		status = 499
+		msg = "client closed request"
+		reason = "client_closed"
+	} else if isTimeoutErr(err) {
+		status = http.StatusGatewayTimeout
+		msg = "gateway timeout"
+		reason = "timeout"
+	}
+
+	poolName := "none"
+	if state != nil && state.pool != "" {
+		poolName = state.pool
+	}
+	ps.metrics.IncCounter("goproxy_upstream_errors_total", map[string]string{"pool": poolName, "reason": reason})
+
+	writeJSONError(w, status, msg)
+	if state != nil {
+		state.setStatus(status)
 	}
 }
 
-func (ps *ProxyServer) buildErrorHandler() func(http.ResponseWriter, *http.Request, error) {
-	return func(w http.ResponseWriter, r *http.Request, err error) {
-		state, ok := proxyStateFromContext(r.Context())
+func isTimeoutErr(err error) bool {
+	type timeouter interface{ Timeout() bool }
+	if te, ok := err.(timeouter); ok {
+		return te.Timeout()
+	}
+	return false
+}
 
-		status := http.StatusBadGateway
-		msg := "bad gateway"
-		reason := "bad_gateway"
-		poolName := "none"
+func (ps *ProxyServer) logRequest(req *http.Request, state *proxyState, start time.Time) {
+	route, pool, backend, status, bytes, err := state.snapshot()
+	dur := time.Since(start)
 
-		switch {
-		case ok && state != nil && errors.Is(state.Err, errNoRoute):
-			status = http.StatusNotFound
-			msg = "not found"
-			reason = "no_route"
-		case ok && state != nil && errors.Is(state.Err, ErrNoHealthyBackends):
-			status = http.StatusServiceUnavailable
-			msg = "service unavailable"
-			reason = "no_healthy_backend"
-			if state.Pool != nil {
-				poolName = state.Pool.Name
-			}
-		case ok && state != nil && state.Backend != nil:
-			state.Backend.ActiveConns.Add(-1)
-			if state.Pool != nil {
-				state.Pool.MarkFailure(state.Backend)
-				poolName = state.Pool.Name
-				if ps.metrics != nil {
-					ps.metrics.setBackendUp(state.Pool.Name, state.Backend.URL.String(), false)
-				}
-			}
-			if isClientClosed(r) {
-				status = 499
-				msg = "client closed request"
-				reason = "client_closed"
-			} else if errors.Is(err, context.DeadlineExceeded) {
-				status = http.StatusGatewayTimeout
-				msg = "gateway timeout"
-				reason = "timeout"
-			}
-		default:
-			if ps.logger != nil {
-				ps.logger.Warn("proxy error with no request state", "error", err)
-			}
-		}
+	level := "INFO"
+	if status >= 500 {
+		level = "ERROR"
+	} else if status >= 400 {
+		level = "WARN"
+	}
 
-		if ps.metrics != nil {
-			ps.metrics.incUpstreamErrors(poolName, reason)
-			ps.metrics.incRequests(pathOrUnmatched(r), poolName, r.Method, itoa(status))
-		}
+	errStr := ""
+	if err != nil {
+		errStr = err.Error()
+	}
 
-		writeJSONError(w, status, msg)
+	ps.logger.Printf("%s proxy_request method=%s path=%s route=%s pool=%s backend=%s status=%d duration_ms=%d bytes_out=%d remote_addr=%s user_agent=%q error=%q",
+		level, req.Method, redactPath(req.URL.Path), route, pool, backend, status, dur.Milliseconds(), bytes, req.RemoteAddr, req.UserAgent(), errStr)
+}
+
+func redactPath(p string) string {
+	return p
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+
+// LoggingRecoverMiddleware wraps next with panic recovery, converting any
+// panic into a generic 500 response instead of crashing the process.
+func LoggingRecoverMiddleware(next http.Handler, logger *log.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Printf("ERROR panic recovered method=%s path=%s panic=%v", req.Method, req.URL.Path, rec)
+				writeJSONError(w, http.StatusInternalServerError, "internal server error")
+			}
+		}()
+		next.ServeHTTP(w, req)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+var hopHeaders = []string{
+	"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+}
+
+func stripHopHeaders(h http.Header) {
+	for _, hh := range hopHeaders {
+		h.Del(hh)
 	}
 }
 
-func pathOrUnmatched(r *http.Request) string {
-	if r.URL != nil && r.URL.Path != "" {
-		return r.URL.Path
+func clientIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
 	}
-	return "unmatched"
-}
-
-func isClientClosed(r *http.Request) bool {
-	select {
-	case <-r.Context().Done():
-		return errors.Is(r.Context().Err(), context.Canceled)
-	default:
-		return false
+	if net.ParseIP(host) == nil {
+		return ""
 	}
+	return host
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	_, _ = fmt.Fprintf(w, `{"error":%q}`, msg)
 }
 
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
+func boolToFloat(b bool) float64 {
+	if b {
+		return 1
 	}
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-	var b [20]byte
-	pos := len(b)
-	for i > 0 {
-		pos--
-		b[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if neg {
-		pos--
-		b[pos] = '-'
-	}
-	return string(b[pos:])
+	return 0
 }
 
-// ServeHTTP implements http.Handler for the catch-all proxy route.
-func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			if ps.logger != nil {
-				ps.logger.Error("panic recovered in proxy handler", "panic", rec, "path", r.URL.Path)
-			}
-			writeJSONError(w, http.StatusInternalServerError, "internal server error")
-		}
-	}()
-	ps.proxy.ServeHTTP(w, r)
+type statusCapturingWriter struct {
+	http.ResponseWriter
+	status int
 }
 
-// ---------------------------------------------------------------------
-// Header helpers
-// ---------------------------------------------------------------------
-
-var hopByHopHeaders = []string{
-	"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
-	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+func (w *statusCapturingWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
-
-func stripHopByHopHeaders(h http.Header) {
-	for _, hh := range hopByHopHeaders {
-		h.Del(hh)
-	}
-}
-
-func validClientIP(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.String()
-	}
-	return ""
-}
-
-// ---------------------------------------------------------------------
-// HTTP handlers: /healthz, /metrics, HTTPS redirect
-// ---------------------------------------------------------------------
-
-type healthChecker interface {
-	AnyPoolHealthy() bool
-}
-
-// NewMux builds the top-level http.Handler wiring /healthz, /metrics, and
-// the catch-all reverse proxy, with logging applied uniformly.
-func NewMux(ps *ProxyServer, metrics *Metrics, hc healthChecker, logger *slog.Logger) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", HealthzHandler(hc))
-	mux.Handle("/metrics", MetricsHandler(metrics))
-	mux.Handle("/", loggingMiddleware(logger, ps))
-	return mux
-}
-
-// HealthzHandler serves GET/HEAD /healthz.
-func HealthzHandler(hc healthChecker) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-
-		healthy := hc == nil || hc.AnyPoolHealthy()
-		if healthy {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"status":"ok"}`))
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"status":"unhealthy"}`))
-	}
-}
-
-// MetricsHandler serves GET /metrics in Prometheus text exposition format.
-func MetricsHandler(metrics *Metrics) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "
