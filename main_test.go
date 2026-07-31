@@ -41,7 +41,7 @@ func TestNewStrategyDefault(t *testing.T) {
 		t.Fatal("newStrategy returned nil")
 	}
 	if _, ok := s.(*RoundRobinStrategy); !ok {
-		t.Errorf("newStrategy(%q) = %T, want *RoundRobinStrategy", "unknown-strategy", s)
+		t.Errorf("newStrategy(%q) returned wrong type, want *RoundRobinStrategy", "unknown-strategy")
 	}
 }
 
