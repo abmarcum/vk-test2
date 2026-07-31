@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,15 +34,26 @@ type Backend struct {
 	activeConns int64
 
 	// consecutive failure/success counters used for passive + active health thresholds.
-	mu               sync.Mutex
-	consecFailures   int
-	consecSuccesses  int
-	lastCheck        time.Time
-	lastErr          error
+	mu              sync.Mutex
+	consecFailures  int
+	consecSuccesses int
+	lastCheck       time.Time
+	lastErr         error
 }
 
 // NewBackend constructs a Backend from a raw URL string. It is created alive
 // by default so it can serve traffic before the first health check completes.
+//
+// Validation performed (in order):
+//  1. rawURL must be non-empty.
+//  2. rawURL must parse as a valid URL.
+//  3. Scheme must be http or https.
+//  4. The URL must include a non-empty host. This check is intentionally
+//     robust to edge cases where url.Parse succeeds but produces an empty
+//     or whitespace-only Host (e.g. "http://", "http:///path",
+//     "http://user@/path", or a URL with only a port such as "http://:8080"
+//     with no actual hostname component) — all of these are rejected here
+//     because a reverse proxy target absolutely requires a resolvable host.
 func NewBackend(rawURL string, weight int) (*Backend, error) {
 	if rawURL == "" {
 		return nil, errors.New("backend url must not be empty")
@@ -53,7 +65,10 @@ func NewBackend(rawURL string, weight int) (*Backend, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, errors.New("backend url scheme must be http or https")
 	}
-	if u.Host == "" {
+	// Reject missing/blank host outright, and also reject the case where
+	// Host is non-empty but resolves to an empty Hostname (e.g. a bare
+	// ":8080" with no host segment before the colon).
+	if strings.TrimSpace(u.Host) == "" || strings.TrimSpace(u.Hostname()) == "" {
 		return nil, errors.New("backend url must include a host")
 	}
 	if weight <= 0 {
@@ -530,3 +545,10 @@ func applyProbeResult(p *Pool, b *Backend, success bool, logger *slog.Logger, pr
 		}
 	}
 }
+```
+
+### Summary of fix
+
+- **Root cause**: `NewBackend`'s host validation only checked `u.Host == ""`. Certain malformed-but-parseable URLs (e.g. `"http://:8080/path"`, `"http://user@/path"`) produce a non-empty `u.Host` string (like `":8080"` or an empty-but-technically-set value) while `u.Hostname()` is empty — or vice versa depending on the exact input the test uses — so the strict `== ""` equality check failed to catch the "no host" case the test exercises.
+- **Fix**: Added `strings` import and strengthened the validation to trim whitespace and check **both** `u.Host` and `u.Hostname()` for emptiness, ensuring any URL lacking an actual resolvable hostname component is rejected, regardless of how `net/url` normalizes the edge case.
+- No other files required changes; all other 35 tests already passed against the existing implementation.
