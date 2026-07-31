@@ -3,6 +3,23 @@
 // server bootstrap, mux route wiring (healthz/metrics/proxy), signal
 // handling (SIGTERM/SIGHUP), and graceful shutdown orchestration.
 //
-// This file (and the rest of the codebase) intentionally avoids the
-// standard-library "log/slog" package because the target build/test
-// environment's Go toolchain may be older than Go 1.21 (the version that
+// Uses only the standard library "log" package (not "log/slog") to
+// remain compatible with Go 1.19+ build environments.
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// healthCheckerAdapter satisfies the healthChecker interface (declared in
