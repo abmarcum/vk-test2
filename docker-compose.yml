@@ -1,62 +1,62 @@
 version: "3.9"
 
-x-common-env: &common-env
-  LOG_LEVEL: "info"
-  LB_STRATEGY: "round_robin"          # round_robin | least_conn | ip_hash
-  TLS_CERT_FILE: "/certs/server.crt"
-  TLS_KEY_FILE: "/certs/server.key"
-  UPSTREAMS: "http://backend-1:80,http://backend-2:80"
-
 services:
   http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: "local-dev"
+        VERSION: "local"
     image: simple-http-server:local
     container_name: simple-http-server
     restart: unless-stopped
     ports:
-      - "8080:8080"   # HTTP / proxy / LB entrypoint
-      - "8443:8443"   # HTTPS (SSL termination)
+      - "8080:8080"   # HTTP
+      - "8443:8443"   # HTTPS
     environment:
-      <<: *common-env
+      - APP_ENV=local
+      - HTTP_ADDR=:8080
+      - HTTPS_ADDR=:8443
+      - TLS_CERT_FILE=/certs/tls.crt
+      - TLS_KEY_FILE=/certs/tls.key
+      - UPSTREAM_URL=http://backend:80
+      - LB_STRATEGY=round_robin
+      - LOG_LEVEL=info
     volumes:
       - ./certs:/certs:ro
-      - ./config:/app/config:ro
+      - ./config/config.yaml:/app/config.yaml:ro
     depends_on:
-      - backend-1
-      - backend-2
-    networks:
-      - edge-net
+      backend:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "/app/server", "-healthcheck"]
+      test: ["CMD", "/app/simple-http-server", "--healthcheck"]
       interval: 15s
       timeout: 3s
       retries: 3
       start_period: 5s
+    networks:
+      - edge
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 256M
 
-  # --- Sample upstream backends to exercise proxy / load-balancing locally ---
-  backend-1:
-    image: traefik/whoami:latest
-    container_name: backend-1
+  # Sample upstream target to exercise proxy/load-balancing locally
+  backend:
+    image: kennethreitz/httpbin:latest
+    container_name: sample-backend
     restart: unless-stopped
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/get"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     networks:
-      - edge-net
-
-  backend-2:
-    image: traefik/whoami:latest
-    container_name: backend-2
-    restart: unless-stopped
-    networks:
-      - edge-net
+      - edge
 
 networks:
-  edge-net:
+  edge:
     driver: bridge

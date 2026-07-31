@@ -1,32 +1,46 @@
 apiVersion: v1
+kind: Namespace
+metadata:
+  name: simple-http-server
+  labels:
+    app.kubernetes.io/name: simple-http-server
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: simple-http-server
+  namespace: simple-http-server
+  annotations:
+    iam.gke.io/gcp-service-account: simple-http-server@PROJECT_ID.iam.gserviceaccount.com
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: http-server-config
-  namespace: default
-  labels:
-    app: http-server
+  name: simple-http-server-config
+  namespace: simple-http-server
 data:
-  server.yaml: |
-    listen:
-      http: ":8080"
-      https: ":8443"
-    tls:
-      certFile: /etc/tls/tls.crt
-      keyFile: /etc/tls/tls.key
-    loadBalancer:
-      strategy: round_robin
-      upstreams:
-        - http://backend-1.default.svc.cluster.local
-        - http://backend-2.default.svc.cluster.local
+  config.yaml: |
+    server:
+      http_addr: ":8080"
+      https_addr: ":8443"
+      read_timeout: 15s
+      write_timeout: 15s
+      idle_timeout: 60s
+    proxy:
+      upstream: "http://backend-service.default.svc.cluster.local:80"
+      strategy: "round_robin"
+    logging:
+      level: "info"
+      format: "json"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: http-server
-  namespace: default
+  name: simple-http-server
+  namespace: simple-http-server
   labels:
-    app: http-server
-    tier: edge
+    app.kubernetes.io/name: simple-http-server
+    app.kubernetes.io/component: edge-proxy
 spec:
   replicas: 3
   revisionHistoryLimit: 5
@@ -37,39 +51,45 @@ spec:
       maxUnavailable: 0
   selector:
     matchLabels:
-      app: http-server
+      app.kubernetes.io/name: simple-http-server
   template:
     metadata:
       labels:
-        app: http-server
-        tier: edge
+        app.kubernetes.io/name: simple-http-server
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: http-server-sa
+      serviceAccountName: simple-http-server
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
               podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
                 labelSelector:
-                  matchExpressions:
-                    - key: app
-                      operator: In
-                      values: ["http-server"]
-                topologyKey: "kubernetes.io/hostname"
+                  matchLabels:
+                    app.kubernetes.io/name: simple-http-server
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: simple-http-server
       containers:
-        - name: http-server
-          image: us-docker.pkg.dev/PROJECT_ID/simple-http-server/simple-http-server:latest
-          imagePullPolicy: Always
-          args: ["-config", "/app/config/server.yaml"]
+        - name: simple-http-server
+          image: gcr.io/PROJECT_ID/simple-http-server:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/app/config.yaml"]
           ports:
             - name: http
               containerPort: 8080
@@ -78,45 +98,45 @@ spec:
               containerPort: 8443
               protocol: TCP
           env:
-            - name: LOG_LEVEL
-              value: "info"
-            - name: LB_STRATEGY
-              value: "round_robin"
-          envFrom:
-            - secretRef:
-                name: http-server-secrets
-                optional: true
+            - name: TLS_CERT_FILE
+              value: /etc/tls/tls.crt
+            - name: TLS_KEY_FILE
+              value: /etc/tls/tls.key
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             requests:
-              cpu: "100m"
-              memory: "64Mi"
+              cpu: 100m
+              memory: 128Mi
             limits:
-              cpu: "500m"
-              memory: "256Mi"
+              cpu: 500m
+              memory: 256Mi
           readinessProbe:
             httpGet:
-              path: /healthz
-              port: 8080
-            initialDelaySeconds: 3
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8080
+              port: http
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 2
             failureThreshold: 3
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
           volumeMounts:
             - name: config
-              mountPath: /app/config
+              mountPath: /etc/app
               readOnly: true
             - name: tls-certs
               mountPath: /etc/tls
@@ -126,40 +146,34 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: http-server-config
+            name: simple-http-server-config
         - name: tls-certs
           secret:
-            secretName: http-server-tls
+            secretName: simple-http-server-tls
         - name: tmp
           emptyDir: {}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: http-server-sa
-  namespace: default
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: http-server-pdb
-  namespace: default
+  name: simple-http-server-pdb
+  namespace: simple-http-server
 spec:
   minAvailable: 2
   selector:
     matchLabels:
-      app: http-server
+      app.kubernetes.io/name: simple-http-server
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: http-server-hpa
-  namespace: default
+  name: simple-http-server-hpa
+  namespace: simple-http-server
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: http-server
+    name: simple-http-server
   minReplicas: 3
   maxReplicas: 10
   metrics:
@@ -168,10 +182,10 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 70
+          averageUtilization: 65
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 80
+          averageUtilization: 75
