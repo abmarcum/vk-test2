@@ -1,33 +1,22 @@
-// resolution failures entirely. Config files may be authored as JSON;
-// operators who prefer YAML can convert with any standard tool prior to
-// deployment.
-package main
-
-import (
-	"encoding/json"
-	"fmt"
-	"net/url"
-)
-
-// parseConfig decodes raw JSON bytes into a Config. Unknown fields are
-// rejected to catch typos, mirroring the strict-schema behavior described
-// in the project documentation.
-func parseConfig(raw []byte) (*Config, error) {
-	dec := json.NewDecoder(newBytesReader(raw))
-	dec.DisallowUnknownFields()
-
-	var cfg Config
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("decode json: %w", err)
-	}
-	return &cfg, nil
-}
-
-// parseURLStrict parses a URL, returning an error for malformed input.
-func parseURLStrict(raw string) (*url.URL, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("malformed url: %w", err)
-	}
-	return u, nil
-}
+github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYqBQsYPq4a3zGxc4YQ=
+github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0eXd6MtESH8=
+github.com/cespare/xxhash/v2 v2.0.2 h1:U57cbrRIC1WCbwsfg7yV/9HzHVKO9ZUeFeCJnbHrmS4=
+github.com/cespare/xxhash/v2 v2.0.2/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
+github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
+github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 h1:jWpvCLoY8Z/e3VKvlsiIGKtc+UG6U5vzxaoagmhXfyg=
+github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0/go.mod h1:QUyp042oQthUoa9bqDv0ER0wrtXnBruoNd7aNjkbP+k=
+github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+github.com/prometheus/client_golang v1.19.1 h1:wZWJDwK+NameRJuPGDhlnFgx8e8HN3XHQeLaYJFJBOE=
+github.com/prometheus/client_golang v1.19.1/go.mod h1:mP78NwGzrVks5S2H6ab8+ZZGJLZUq1hoULYBAYBw1Ho=
+github.com/prometheus/client_model v0.6.1 h1:ZKSh/rekM+n3CeS952MLRAdFwIKqeY8b62p8ais2e9E=
+github.com/prometheus/client_model v0.6.1/go.mod h1:OrxVMOVHjw3lKMa8+x6HeMGkHPk4TCXTU76//COuFmU=
+github.com/prometheus/common v0.55.0 h1:KEi6DKazxYs2G4ebRJRArfCJ5nY1jt5Rvj3nqz9zP5xt=
+github.com/prometheus/common v0.55.0/go.mod h1:2SECS4xJG1kd8XF9IcM1gMX6iaSIzsbwLQKvez2K1kk=
+github.com/prometheus/procfs v0.15.1 h1:YagwOFzUgYfKKHX6Dr+sHT7km/hxC76UB0learFtZDs=
+github.com/prometheus/procfs v0.15.1/go.mod h1:fB45yRUv8NstnjriLhBQLuOUt+WW4BsoGhij/e3PBqk=
+google.golang.org/protobuf v1.34.2 h1:6xV6lTsCfpGD21XK49h7MhtcApnLqkfYgPde/Dv8REo=
+google.golang.org/protobuf v1.34.2/go.mod h1:qYOHts0dSfpeUzUFpOMr/WGzszTmLH+DiWniOlNbLDw=
+gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=

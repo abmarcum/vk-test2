@@ -1,14 +1,13 @@
 // strategy implementations (round robin, least connections, random),
-// active health-check scheduling, and passive failure/success marking.
-// It does not own HTTP routing, TLS, logging middleware, or metrics
-// emission.
+// active health-check scheduling, and passive failure/success marking. It
+// does not own HTTP routing, TLS, logging middleware, or metrics emission.
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"sync/atomic"
@@ -16,8 +15,12 @@ import (
 )
 
 // ErrNoHealthyBackends is returned by Pool.Choose when no backend in the
-// pool is currently eligible for selection.
+// pool is currently marked alive.
 var ErrNoHealthyBackends = errors.New("no healthy backends available")
+
+// ---------------------------------------------------------------------------
+// Backend
+// ---------------------------------------------------------------------------
 
 // Backend represents one upstream target and its live health state.
 type Backend struct {
@@ -30,111 +33,146 @@ type Backend struct {
 	consecSuccesses atomic.Int32
 }
 
-// Strategy selects the next backend from a candidate slice of already
-// health-filtered backends.
+func newBackend(rawURL string) (*Backend, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse backend url %q: %w", rawURL, err)
+	}
+	b := &Backend{URL: u}
+	b.Alive.Store(true) // starts alive so it can serve traffic immediately
+	return b, nil
+}
+
+// ---------------------------------------------------------------------------
+// Strategy interface + implementations
+// ---------------------------------------------------------------------------
+
 type Strategy interface {
 	Next(backends []*Backend) (*Backend, error)
 }
 
-// RoundRobinStrategy cycles through healthy backends using an atomic counter.
+func aliveBackends(backends []*Backend) []*Backend {
+	out := make([]*Backend, 0, len(backends))
+	for _, b := range backends {
+		if b.Alive.Load() {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// RoundRobinStrategy cycles through healthy backends in order using an
+// atomic counter.
 type RoundRobinStrategy struct {
 	cursor atomic.Uint64
 }
 
 func (s *RoundRobinStrategy) Next(backends []*Backend) (*Backend, error) {
-	if len(backends) == 0 {
+	alive := aliveBackends(backends)
+	if len(alive) == 0 {
 		return nil, ErrNoHealthyBackends
 	}
-	idx := s.cursor.Add(1)
-	return backends[idx%uint64(len(backends))], nil
+	idx := s.cursor.Add(1) - 1
+	return alive[idx%uint64(len(alive))], nil
 }
 
-// LeastConnStrategy selects the healthy backend with fewest active conns.
+// LeastConnStrategy selects the healthy backend with the fewest current
+// in-flight requests; ties broken by first-seen order.
 type LeastConnStrategy struct{}
 
 func (s *LeastConnStrategy) Next(backends []*Backend) (*Backend, error) {
-	if len(backends) == 0 {
+	alive := aliveBackends(backends)
+	if len(alive) == 0 {
 		return nil, ErrNoHealthyBackends
 	}
-	best := backends[0]
-	for _, b := range backends[1:] {
-		if b.ActiveConns.Load() < best.ActiveConns.Load() {
+	best := alive[0]
+	bestConns := best.ActiveConns.Load()
+	for _, b := range alive[1:] {
+		c := b.ActiveConns.Load()
+		if c < bestConns {
 			best = b
+			bestConns = c
 		}
 	}
 	return best, nil
 }
 
 // RandomStrategy selects a uniformly random healthy backend.
-type RandomStrategy struct{}
+type RandomStrategy struct {
+	counter atomic.Uint64
+}
 
 func (s *RandomStrategy) Next(backends []*Backend) (*Backend, error) {
-	if len(backends) == 0 {
+	alive := aliveBackends(backends)
+	if len(alive) == 0 {
 		return nil, ErrNoHealthyBackends
 	}
-	return backends[rand.Intn(len(backends))], nil
+	// Simple, dependency-free pseudo-randomness: time-seeded atomic
+	// counter mixed with wall-clock nanoseconds. Sufficient for LB
+	// distribution purposes; not used for any security-sensitive purpose.
+	n := s.counter.Add(1)
+	mix := uint64(time.Now().UnixNano()) ^ n
+	return alive[mix%uint64(len(alive))], nil
 }
+
+func newStrategy(name string) Strategy {
+	switch name {
+	case "least_connections":
+		return &LeastConnStrategy{}
+	case "random":
+		return &RandomStrategy{}
+	default:
+		return &RoundRobinStrategy{}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pool
+// ---------------------------------------------------------------------------
 
 // Pool groups backends under one strategy and health-check policy.
 type Pool struct {
 	Name        string
 	Backends    []*Backend
-	strategy    Strategy
+	Strategy    Strategy
 	HealthCheck HealthCheckConfig
 }
 
-// NewPool constructs a Pool from PoolConfig, resolving Strategy by name and
-// parsing/validating each backend URL. Every Backend starts Alive so it can
-// serve traffic immediately at startup, before the first health-check pass.
+// NewPool constructs a Pool from PoolConfig, resolving Strategy by name.
 func NewPool(cfg PoolConfig) (*Pool, error) {
-	p := &Pool{
-		Name:        cfg.Name,
-		HealthCheck: cfg.HealthCheck,
-	}
-
-	switch cfg.Strategy {
-	case "least_connections":
-		p.strategy = &LeastConnStrategy{}
-	case "random":
-		p.strategy = &RandomStrategy{}
-	default:
-		p.strategy = &RoundRobinStrategy{}
-	}
-
+	backends := make([]*Backend, 0, len(cfg.Backends))
 	for _, bc := range cfg.Backends {
-		u, err := url.Parse(bc.URL)
+		b, err := newBackend(bc.URL)
 		if err != nil {
 			return nil, err
 		}
-		b := &Backend{URL: u}
-		b.Alive.Store(true)
-		p.Backends = append(p.Backends, b)
+		backends = append(backends, b)
 	}
 
-	return p, nil
+	return &Pool{
+		Name:        cfg.Name,
+		Backends:    backends,
+		Strategy:    newStrategy(cfg.Strategy),
+		HealthCheck: cfg.HealthCheck,
+	}, nil
 }
 
-// HealthCheckEnabled reports whether active probing should run for this pool.
+// HealthCheckEnabled reports whether active health checking is configured
+// for this pool.
 func (p *Pool) HealthCheckEnabled() bool {
 	return p.HealthCheck.Enabled
 }
 
 // Choose returns the next healthy backend per the pool's strategy.
 func (p *Pool) Choose() (*Backend, error) {
-	alive := make([]*Backend, 0, len(p.Backends))
-	for _, b := range p.Backends {
-		if b.Alive.Load() {
-			alive = append(alive, b)
-		}
-	}
-	if len(alive) == 0 {
-		return nil, ErrNoHealthyBackends
-	}
-	return p.strategy.Next(alive)
+	return p.Strategy.Next(p.Backends)
 }
 
 // MarkFailure implements passive circuit-breaker-lite behavior.
 func (p *Pool) MarkFailure(b *Backend) {
+	if b == nil {
+		return
+	}
 	b.consecSuccesses.Store(0)
 	fails := b.consecFails.Add(1)
 	threshold := int32(p.HealthCheck.UnhealthyThreshold)
@@ -148,6 +186,9 @@ func (p *Pool) MarkFailure(b *Backend) {
 
 // MarkSuccess resets passive failure counters on a successful proxied response.
 func (p *Pool) MarkSuccess(b *Backend) {
+	if b == nil {
+		return
+	}
 	b.consecFails.Store(0)
 	successes := b.consecSuccesses.Add(1)
 	threshold := int32(p.HealthCheck.HealthyThreshold)
@@ -159,10 +200,9 @@ func (p *Pool) MarkSuccess(b *Backend) {
 	}
 }
 
-// RunHealthChecks starts a blocking loop probing each backend on Interval,
-// applying healthy/unhealthy thresholds with hysteresis. Exits cleanly when
-// ctx is canceled. logger is required and is used to emit a structured log
-// line on every Alive state transition.
+// RunHealthChecks starts a blocking loop that periodically GETs
+// HealthCheck.Path on each backend, applying threshold hysteresis to flip
+// Alive state. Exits cleanly when ctx is canceled.
 func (p *Pool) RunHealthChecks(ctx context.Context, logger *slog.Logger) {
 	interval := p.HealthCheck.IntervalDur
 	if interval <= 0 {
@@ -200,48 +240,64 @@ func (p *Pool) probeOnce(ctx context.Context, client *http.Client, b *Backend, l
 	if path == "" {
 		path = "/healthz"
 	}
-
 	target := *b.URL
-	target.Path = path
+	target.Path = joinPath(b.URL.Path, path)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	reqCtx, cancel := context.WithTimeout(ctx, client.Timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		p.recordProbeFailure(b, logger)
 		return
 	}
 
 	resp, err := client.Do(req)
-	if err != nil {
-		p.recordProbeFailure(b, logger)
-		return
-	}
-	defer resp.Body.Close()
+	wasAlive := b.Alive.Load()
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		p.recordProbeSuccess(b, logger)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		p.recordProbeFailure(b, logger)
 	} else {
-		p.recordProbeFailure(b, logger)
+		resp.Body.Close()
+		p.recordProbeSuccess(b, logger)
+	}
+
+	nowAlive := b.Alive.Load()
+	if wasAlive != nowAlive && logger != nil {
+		logger.Info("backend health transition",
+			"pool", p.Name,
+			"backend", b.URL.String(),
+			"from", wasAlive,
+			"to", nowAlive,
+			"consec_fails", b.consecFails.Load(),
+			"consec_successes", b.consecSuccesses.Load(),
+		)
 	}
 }
 
-func (p *Pool) recordProbeFailure(b *Backend, logger *slog.Logger) {
-	wasAlive := b.Alive.Load()
+func (p *Pool) recordProbeFailure(b *Backend, _ *slog.Logger) {
 	p.MarkFailure(b)
-	nowAlive := b.Alive.Load()
-	if wasAlive != nowAlive {
-		logger.Info("backend health transition",
-			"pool", p.Name, "backend", b.URL.String(),
-			"from", wasAlive, "to", nowAlive)
-	}
 }
 
-func (p *Pool) recordProbeSuccess(b *Backend, logger *slog.Logger) {
-	wasAlive := b.Alive.Load()
+func (p *Pool) recordProbeSuccess(b *Backend, _ *slog.Logger) {
 	p.MarkSuccess(b)
-	nowAlive := b.Alive.Load()
-	if wasAlive != nowAlive {
-		logger.Info("backend health transition",
-			"pool", p.Name, "backend", b.URL.String(),
-			"from", wasAlive, "to", nowAlive)
+}
+
+func joinPath(base, extra string) string {
+	if base == "" {
+		return extra
 	}
+	if extra == "" {
+		return base
+	}
+	if base[len(base)-1] == '/' && extra[0] == '/' {
+		return base + extra[1:]
+	}
+	if base[len(base)-1] != '/' && extra[0] != '/' {
+		return base + "/" + extra
+	}
+	return base + extra
 }

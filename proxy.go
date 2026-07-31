@@ -1,140 +1,167 @@
-type healthCheckerAdapter struct {
-	pools map[string]*Pool
+// selection), reverse proxy plumbing, header injection/sanitization,
+// Prometheus metrics registration & recording, structured request logging,
+// and the /healthz and /metrics HTTP handlers.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+type compiledRoute struct {
+	prefix string
+	pool   *Pool
 }
 
-// AnyPoolHealthy reports true if at least one backend across any pool is
-// currently alive, or if there are no pools/backends configured at all
-// (fail-open for liveness purposes when health checking is not wired up).
-func (h *healthCheckerAdapter) AnyPoolHealthy() bool {
-	if len(h.pools) == 0 {
-		return true
-	}
-	for _, p := range h.pools {
-		for _, b := range p.Backends {
-			if b.Alive.Load() {
-				return true
-			}
-		}
-	}
-	return false
+// Router maps path prefixes to Pools using longest-prefix-match.
+type Router struct {
+	routes []compiledRoute
 }
 
-func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+// NewRouter builds a Router from RouteConfig list + resolved Pool map.
+func NewRouter(routes []RouteConfig, pools map[string]*Pool) (*Router, error) {
+	compiled := make([]compiledRoute, 0, len(routes))
+	for _, rc := range routes {
+		pool, ok := pools[rc.Pool]
+		if !ok {
+			return nil, fmt.Errorf("route %q references unknown pool %q", rc.PathPrefix, rc.Pool)
+		}
+		compiled = append(compiled, compiledRoute{prefix: rc.PathPrefix, pool: pool})
 	}
+	sort.SliceStable(compiled, func(i, j int) bool {
+		return len(compiled[i].prefix) > len(compiled[j].prefix)
+	})
+	return &Router{routes: compiled}, nil
 }
 
-// run performs the full bootstrap sequence and blocks until shutdown
-// completes. Returns a non-nil error only for startup-time failures.
-func run() error {
-	configPath := flag.String("config", envOr("CONFIG_PATH", "/app/config/config.yaml"), "path to config file")
-	logLevel := flag.String("log-level", envOr("LOG_LEVEL", "info"), "log level: debug|info|warn|error")
-	flag.Parse()
-
-	logger := newLogger(*logLevel)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	defer stop()
-
-	cfg, err := LoadConfig(ctx, *configPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-
-	pools := make(map[string]*Pool, len(cfg.Pools))
-	for _, pc := range cfg.Pools {
-		pool, err := NewPool(pc)
-		if err != nil {
-			return fmt.Errorf("construct pool %q: %w", pc.Name, err)
-		}
-		pools[pc.Name] = pool
-	}
-
-	router, err := NewRouter(cfg.Routes, pools)
-	if err != nil {
-		return fmt.Errorf("construct router: %w", err)
-	}
-
-	metrics := NewMetrics()
-	proxyServer := NewProxyServer(router, metrics, logger)
-	hc := &healthCheckerAdapter{pools: pools}
-
-	healthCtx, cancelHealth := context.WithCancel(context.Background())
-	defer cancelHealth()
-	for _, pool := range pools {
-		if pool.HealthCheckEnabled() {
-			go pool.RunHealthChecks(healthCtx, logger)
+// Match returns the Pool responsible for a given request path, along with
+// the matched prefix, using longest-prefix-match semantics.
+func (r *Router) Match(path string) (*Pool, string, bool) {
+	for _, rt := range r.routes {
+		if strings.HasPrefix(path, rt.prefix) {
+			return rt.pool, rt.prefix, true
 		}
 	}
-
-	mux := NewMux(proxyServer, metrics, hc, logger)
-
-	srv := &http.Server{
-		Addr:              cfg.Server.HTTPAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
-		ReadTimeout:       cfg.Server.Timeouts.ReadDur,
-		WriteTimeout:      cfg.Server.Timeouts.WriteDur,
-		IdleTimeout:       cfg.Server.Timeouts.IdleDur,
-	}
-
-	servers := []*http.Server{srv}
-
-	go func() {
-		logger.Info("http listener starting", "addr", cfg.Server.HTTPAddr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("http listener failed", "error", err.Error())
-		}
-	}()
-
-	if cfg.Server.EnableTLS {
-		tlsCfg, err := buildTLSListenerConfig(cfg.Server.TLS.CertPEM, cfg.Server.TLS.KeyPEM, cfg.Server.TLS.MinVersion)
-		if err != nil {
-			return fmt.Errorf("build tls config: %w", err)
-		}
-
-		httpsMux := NewMux(proxyServer, metrics, hc, logger)
-
-		httpsSrv := &http.Server{
-			Addr:              cfg.Server.HTTPSAddr,
-			Handler:           httpsMux,
-			TLSConfig:         tlsCfg,
-			ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
-			ReadTimeout:       cfg.Server.Timeouts.ReadDur,
-			WriteTimeout:      cfg.Server.Timeouts.WriteDur,
-			IdleTimeout:       cfg.Server.Timeouts.IdleDur,
-		}
-		servers = append(servers, httpsSrv)
-
-		go func() {
-			logger.Info("https listener starting", "addr", cfg.Server.HTTPSAddr)
-			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("https listener failed", "error", err.Error())
-			}
-		}()
-	} else {
-		logger.Warn("TLS not configured — HTTP-only mode (dev/test)")
-	}
-
-	<-ctx.Done()
-	logger.Info("shutdown signal received")
-	cancelHealth()
-
-	grace := time.Duration(cfg.Server.ShutdownGraceSeconds) * time.Second
-	gracefulShutdown(servers, grace, logger)
-
-	return nil
+	return nil, "", false
 }
 
-// newLogger constructs a JSON slog.Logger at the requested level.
-func newLogger(level string) *slog.Logger {
-	var lvl slog.Level
-	switch level {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lv
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+// Metrics holds all Prometheus collectors, registered on a dedicated
+// registry (not the global default registry).
+type Metrics struct {
+	Registry *prometheus.Registry
+
+	RequestsTotal    *prometheus.CounterVec
+	RequestDuration  *prometheus.HistogramVec
+	InFlight         *prometheus.GaugeVec
+	UpstreamErrors   *prometheus.CounterVec
+	BackendUp        *prometheus.GaugeVec
+	ResponseSize     *prometheus.HistogramVec
+}
+
+// NewMetrics constructs and registers all collectors exactly once.
+func NewMetrics() *Metrics {
+	reg := prometheus.NewRegistry()
+
+	m := &Metrics{
+		Registry: reg,
+		RequestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "goproxy_requests_total",
+			Help: "Total proxied requests, by outcome.",
+		}, []string{"route", "pool", "method", "status"}),
+		RequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "goproxy_request_duration_seconds",
+			Help:    "End-to-end request latency as observed by the proxy.",
+			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+		}, []string{"route", "pool", "method"}),
+		InFlight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "goproxy_in_flight_requests",
+			Help: "Number of requests currently being proxied to a given pool.",
+		}, []string{"pool"}),
+		UpstreamErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "goproxy_upstream_errors_total",
+			Help: "Count of proxy-side error outcomes.",
+		}, []string{"pool", "reason"}),
+		BackendUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "goproxy_backend_up",
+			Help: "1 if backend is currently considered healthy, 0 otherwise.",
+		}, []string{"pool", "backend"}),
+		ResponseSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "goproxy_response_size_bytes",
+			Help:    "Response body size written to the client.",
+			Buckets: prometheus.ExponentialBuckets(128, 4, 8),
+		}, []string{"route", "pool"}),
+	}
+
+	reg.MustRegister(
+		m.RequestsTotal,
+		m.RequestDuration,
+		m.InFlight,
+		m.UpstreamErrors,
+		m.BackendUp,
+		m.ResponseSize,
+	)
+
+	return m
+}
+
+// ---------------------------------------------------------------------------
+// Request-scoped proxy state
+// ---------------------------------------------------------------------------
+
+type proxyContextKey struct{}
+
+type proxyRequestState struct {
+	Pool    *Pool
+	Backend *Backend
+	Route   string
+	Err     error
+	written atomic.Bool
+}
+
+func withProxyState(r *http.Request, state *proxyRequestState) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), proxyContextKey{}, state))
+}
+
+func proxyStateFromContext(ctx context.Context) (*proxyRequestState, bool) {
+	v, ok := ctx.Value(proxyContextKey{}).(*proxyRequestState)
+	return v, ok
+}
+
+// ---------------------------------------------------------------------------
+// ProxyServer
+// ---------------------------------------------------------------------------
+
+// ProxyServer wires a Router into a single http.Handler backed by
+// httputil.ReverseProxy, with Director/ModifyResponse/ErrorHandler hooks
+// that read/write request-scoped state via context.
+type ProxyServer struct {
+	router  *Router
+	metrics *Metrics
+	logger  *slog.Logger
+	rp      *httputil.ReverseProxy
+}
+
+// NewProxyServer constructs a ProxyServer wrapping exactly one
+// httputil.ReverseProxy instance.
+func NewProxyServer(router *Router, metrics *Metrics, logger *slog.Logger) *ProxyServer {
+	ps := &ProxyServer{router: router,
