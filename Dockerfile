@@ -1,59 +1,50 @@
-# syntax=docker/dockerfile:1.7
-############################
-# Stage 1: Build
-############################
-FROM golang:1.22-alpine AS builder
+# syntax=docker/dockerfile:1.6
 
+# -----------------------------------------------------------------------------
+# Stage 1: Build
+# -----------------------------------------------------------------------------
+FROM golang:1.22-bookworm AS builder
+
+ARG APP_NAME=simple-http-server
 ARG VERSION=dev
-ARG COMMIT=unknown
-ARG BUILD_DATE=unknown
+ARG COMMIT_SHA=unknown
 
 WORKDIR /src
 
-RUN apk add --no-cache git ca-certificates tzdata build-base
-
-# Leverage Docker layer caching for modules
+# Cache module downloads separately from source changes
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+# Static, stripped, reproducible binary
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath \
-    -ldflags="-s -w \
-      -X main.version=${VERSION} \
-      -X main.commit=${COMMIT} \
-      -X main.buildDate=${BUILD_DATE}" \
-    -o /out/http-server ./cmd/server
+      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT_SHA}" \
+      -o /out/${APP_NAME} ./cmd/server
 
-############################
-# Stage 2: Runtime
-############################
-FROM alpine:3.19 AS final
+# -----------------------------------------------------------------------------
+# Stage 2: Runtime (distroless, non-root)
+# -----------------------------------------------------------------------------
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
-LABEL org.opencontainers.image.title="simple-http-server" \
-      org.opencontainers.image.description="Simple HTTP server with SSL, reverse-proxy and load-balancing support" \
-      org.opencontainers.image.vendor="Platform Engineering" \
-      org.opencontainers.image.source="https://github.com/org/simple-http-server"
-
-RUN apk add --no-cache ca-certificates tzdata curl \
-    && addgroup -g 10001 -S app \
-    && adduser -u 10001 -S app -G app
+ARG APP_NAME=simple-http-server
+LABEL org.opencontainers.image.title="Simple HTTP Server" \
+      org.opencontainers.image.description="Go HTTP server with SSL termination, reverse proxy and load balancing" \
+      org.opencontainers.image.source="https://github.com/your-org/simple-http-server" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
 
-COPY --from=builder /out/http-server /app/http-server
-COPY configs/ /app/configs/
+COPY --from=builder /out/${APP_NAME} /app/server
+COPY config/config.yaml /app/config/config.yaml
 
-RUN mkdir -p /app/certs /tmp/app \
-    && chown -R app:app /app /tmp/app
-
-USER app:app
+USER nonroot:nonroot
 
 EXPOSE 8080 8443
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -fsk https://localhost:8443/healthz || curl -fs http://localhost:8080/healthz || exit 1
-
-ENTRYPOINT ["/app/http-server"]
-CMD ["--config=/app/configs/config.yaml"]
+ENTRYPOINT ["/app/server"]
+CMD ["--config", "/app/config/config.yaml"]

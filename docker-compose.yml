@@ -1,74 +1,76 @@
 version: "3.9"
 
-x-logging: &default-logging
+x-common-logging: &default-logging
   driver: json-file
   options:
     max-size: "10m"
     max-file: "3"
 
 services:
-  http-server:
+  simple-http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: ${VERSION:-dev}
-    image: simple-http-server:${VERSION:-latest}
+        APP_NAME: simple-http-server
+        VERSION: local
+    image: simple-http-server:local
     container_name: simple-http-server
     restart: unless-stopped
-    logging: *default-logging
     ports:
       - "8080:8080"   # HTTP
       - "8443:8443"   # HTTPS
-    environment:
-      SERVER_HTTP_ADDR: ":8080"
-      SERVER_HTTPS_ADDR: ":8443"
-      SERVER_TLS_CERT: "/app/certs/server.crt"
-      SERVER_TLS_KEY: "/app/certs/server.key"
-      LB_BACKENDS: "http://backend-a:9000,http://backend-b:9000"
-      LB_STRATEGY: "round_robin"
-      LB_HEALTHCHECK_PATH: "/"
-      LOG_LEVEL: "info"
     volumes:
-      - ./configs/config.yaml:/app/configs/config.yaml:ro
+      - ./config/config.yaml:/app/config/config.yaml:ro
       - ./certs:/app/certs:ro
+    environment:
+      - APP_ENV=development
+      - LOG_LEVEL=info
+      - TLS_CERT_FILE=/app/certs/server.crt
+      - TLS_KEY_FILE=/app/certs/server.key
+      - UPSTREAM_BACKENDS=backend-1:8081,backend-2:8081
     depends_on:
-      backend-a:
+      backend-1:
         condition: service_healthy
-      backend-b:
+      backend-2:
         condition: service_healthy
     networks:
       - edge
+    logging: *default-logging
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:8080/healthz"]
-      interval: 15s
-      timeout: 5s
+      test: ["CMD", "/app/server", "--healthcheck"]
+      interval: 10s
+      timeout: 3s
       retries: 3
+      start_period: 5s
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 256M
 
-  # --- Demo upstream backends for proxy / load-balancing testing ---
-  backend-a:
-    image: hashicorp/http-echo:1.0
-    container_name: backend-a
-    command: ["-text=response from backend-a", "-listen=:9000"]
-    networks: [edge]
+  backend-1:
+    image: hashicorp/http-echo:1.0.0
+    container_name: backend-1
+    command: ["-text=hello from backend-1", "-listen=:8081"]
+    networks:
+      - edge
+    logging: *default-logging
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9000/"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081"]
       interval: 10s
       timeout: 3s
       retries: 3
 
-  backend-b:
-    image: hashicorp/http-echo:1.0
-    container_name: backend-b
-    command: ["-text=response from backend-b", "-listen=:9000"]
-    networks: [edge]
+  backend-2:
+    image: hashicorp/http-echo:1.0.0
+    container_name: backend-2
+    command: ["-text=hello from backend-2", "-listen=:8081"]
+    networks:
+      - edge
+    logging: *default-logging
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9000/"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081"]
       interval: 10s
       timeout: 3s
       retries: 3
