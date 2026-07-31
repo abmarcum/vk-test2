@@ -273,3 +273,177 @@ func parseScalar(s string) interface{} {
 	case "false":
 		return false
 	case "null", "~", "":
+		return nil
+	}
+	if i, err := strconv.Atoi(s); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f
+	}
+	return s
+}
+
+// parseMap parses a block mapping at the given indent level starting at
+// *pos, advancing *pos past all consumed lines, and returns the resulting
+// map[string]interface{}.
+func parseMap(lines []yamlLine, pos *int, indent int) map[string]interface{} {
+	result := map[string]interface{}{}
+	parseMapInto(lines, pos, indent, result)
+	return result
+}
+
+// parseMapInto parses key/value pairs at the given indent level directly
+// into an existing map (used to support inline-map list items where the
+// first key appears on the "- key: value" line itself).
+func parseMapInto(lines []yamlLine, pos *int, indent int, result map[string]interface{}) {
+	for *pos < len(lines) {
+		line := lines[*pos]
+		if line.indent != indent {
+			break
+		}
+		content := line.content
+		if content == "-" || strings.HasPrefix(content, "- ") {
+			// Not a mapping line at this level; stop.
+			break
+		}
+		colonIdx := findColon(content)
+		if colonIdx == -1 {
+			*pos++
+			continue
+		}
+		key := strings.TrimSpace(content[:colonIdx])
+		rest := strings.TrimSpace(content[colonIdx+1:])
+		*pos++
+		result[key] = parseValue(lines, pos, indent, rest)
+	}
+}
+
+// parseValue resolves the value for a key: either the inline scalar
+// (inlineRest non-empty), or a nested block map/sequence found on
+// subsequent, deeper-indented lines.
+func parseValue(lines []yamlLine, pos *int, parentIndent int, inlineRest string) interface{} {
+	if inlineRest != "" {
+		return parseScalar(inlineRest)
+	}
+	if *pos < len(lines) && lines[*pos].indent > parentIndent {
+		childIndent := lines[*pos].indent
+		if lines[*pos].content == "-" || strings.HasPrefix(lines[*pos].content, "- ") {
+			return parseList(lines, pos, childIndent)
+		}
+		return parseMap(lines, pos, childIndent)
+	}
+	return nil
+}
+
+// parseList parses a block sequence at the given indent level starting at
+// *pos, advancing *pos past all consumed lines.
+func parseList(lines []yamlLine, pos *int, indent int) []interface{} {
+	var result []interface{}
+	for *pos < len(lines) {
+		line := lines[*pos]
+		if line.indent != indent {
+			break
+		}
+		content := line.content
+		if content != "-" && !strings.HasPrefix(content, "- ") {
+			break
+		}
+		itemContent := strings.TrimSpace(strings.TrimPrefix(content, "-"))
+		*pos++
+
+		if itemContent == "" {
+			if *pos < len(lines) && lines[*pos].indent > indent {
+				childIndent := lines[*pos].indent
+				if lines[*pos].content == "-" || strings.HasPrefix(lines[*pos].content, "- ") {
+					result = append(result, parseList(lines, pos, childIndent))
+				} else {
+					result = append(result, parseMap(lines, pos, childIndent))
+				}
+			} else {
+				result = append(result, nil)
+			}
+			continue
+		}
+
+		colonIdx := findColon(itemContent)
+		if colonIdx == -1 {
+			result = append(result, parseScalar(itemContent))
+			continue
+		}
+
+		// Inline map item: "- key: value" possibly followed by additional
+		// keys at indent+2 on subsequent lines.
+		m := map[string]interface{}{}
+		key := strings.TrimSpace(itemContent[:colonIdx])
+		rest := strings.TrimSpace(itemContent[colonIdx+1:])
+		m[key] = parseValue(lines, pos, indent, rest)
+		parseMapInto(lines, pos, indent+2, m)
+		result = append(result, m)
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// Typed accessors over parsed interface{} values
+// ---------------------------------------------------------------------------
+
+func asMap(v interface{}) map[string]interface{} {
+	if m, ok := v.(map[string]interface{}); ok {
+		return m
+	}
+	return map[string]interface{}{}
+}
+
+func asList(v interface{}) []interface{} {
+	if l, ok := v.([]interface{}); ok {
+		return l
+	}
+	return nil
+}
+
+func asString(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case int:
+		return strconv.Itoa(t)
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+func asBool(v interface{}) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		if b, err := strconv.ParseBool(t); err == nil {
+			return b
+		}
+	}
+	return false
+}
+
+func asInt(v interface{}) int {
+	switch t := v.(type) {
+	case int:
+		return t
+	case float64:
+		return int(t)
+	case string:
+		if i, err := strconv.Atoi(t); err == nil {
+			return i
+		}
+	}
+	return 0
+}

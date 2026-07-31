@@ -1,7 +1,7 @@
 // Package main: intentionally left as an empty placeholder.
 //
-// The Config/ServerConfig/TLSConfig/... struct definitions and the
-// LoadConfig implementation live in config.go. This file exists only to
-// preserve the historical file-name reference in docs/manifest.json and
-// contains no executable code, avoiding any duplicate-declaration risk.
+// The Config/ServerConfig/TLSConfig/... struct definitions and
+// LoadConfig implementation live in config.go; this file exists only to
+// preserve the historical filename referenced in earlier project
+// documentation and intentionally declares nothing further.
 package main
