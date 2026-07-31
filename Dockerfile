@@ -20,6 +20,8 @@ ARG VERSION=dev
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
 
+# All application source lives at the module root (package main) — there
+# is no separate ./cmd/server subdirectory in this project.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
@@ -27,7 +29,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
       -trimpath \
       -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
       -o /out/http-server \
-      ./cmd/server
+      .
 
 # -----------------------------------------------------------
 # Runtime: distroless, non-root, minimal attack surface
@@ -42,14 +44,15 @@ LABEL org.opencontainers.image.title="simple-http-server" \
 WORKDIR /app
 
 COPY --from=builder --chown=nonroot:nonroot /out/http-server /app/http-server
-COPY --from=builder --chown=nonroot:nonroot /src/configs/config.yaml /app/config.yaml
+COPY --from=builder --chown=nonroot:nonroot /src/config.yaml /app/config.yaml
 
 USER nonroot:nonroot
 
 EXPOSE 8080 8443 9090
 
-# Requires the binary to implement a lightweight `healthcheck` subcommand
-# (calls its own /healthz endpoint) since distroless has no shell/curl.
+# The binary implements a lightweight `healthcheck` subcommand (performs an
+# HTTP GET against its own /healthz endpoint and exits 0/1 accordingly)
+# since distroless has no shell/curl.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD ["/app/http-server", "healthcheck"]
 

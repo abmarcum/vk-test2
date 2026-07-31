@@ -30,6 +30,15 @@ func envOrDefault(key, fallback string) string {
 }
 
 func main() {
+	// Lightweight CLI subcommand used by the container HEALTHCHECK
+	// directive (see Dockerfile): performs a local HTTP GET against this
+	// process's own /healthz endpoint and exits 0 on success, 1 otherwise.
+	// This must be checked before flag.Parse() since it is a positional
+	// subcommand, not a flag.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(runHealthcheckCLI())
+	}
+
 	configPath := flag.String("config", envOrDefault("CONFIG_PATH", "config.yaml"), "path to config file")
 	logLevel := flag.String("log-level", envOrDefault("LOG_LEVEL", "info"), "log level (unused by std log, kept for CLI compatibility)")
 	flag.Parse()
@@ -44,6 +53,31 @@ func main() {
 		logger.Printf("ERROR fatal startup error: %v", err)
 		os.Exit(1)
 	}
+}
+
+// runHealthcheckCLI implements the "healthcheck" subcommand: it issues a
+// GET request to the local /healthz endpoint and returns a process exit
+// code (0 = healthy, 1 = unhealthy/unreachable). The target address can be
+// overridden via HEALTHCHECK_ADDR; otherwise it defaults to the configured
+// HTTP listener address on loopback.
+func runHealthcheckCLI() int {
+	addr := envOrDefault("HEALTHCHECK_ADDR", "")
+	if addr == "" {
+		port := envOrDefault("HEALTHCHECK_PORT", "8080")
+		addr = fmt.Sprintf("http://127.0.0.1:%s/healthz", port)
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(addr)
+	if err != nil {
+		return 1
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return 0
+	}
+	return 1
 }
 
 func run(ctx context.Context, logger *log.Logger, configPath string) error {

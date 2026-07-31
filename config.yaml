@@ -1,163 +1,31 @@
-3. **Create a Secret** for TLS certificate/key:
+server:
+  http_addr: ":8080"
+  https_addr: ":8443"
+  enable_tls: false
+  shutdown_grace_seconds: 15
+  tls:
+    cert_file: "certs/server.crt"
+    key_file: "certs/server.key"
+    min_version: "1.2"
+  timeouts:
+    read_header: "5s"
+    read: "15s"
+    write: "15s"
+    idle: "60s"
 
-   ```bash
-   kubectl create secret tls goproxy-tls \
-     --cert=certs/server.crt --key=certs/server.key
-   ```
+routes:
+  - match: "/"
+    pool: "web_pool"
 
-4. **Deployment manifest** (`k8s/deployment.yaml`):
-
-   ```yaml
-   apiVersion: apps/v1
-   kind: Deployment
-   metadata:
-     name: goproxy
-   spec:
-     replicas: 3
-     selector:
-       matchLabels:
-         app: goproxy
-     template:
-       metadata:
-         labels:
-           app: goproxy
-       spec:
-         containers:
-           - name: goproxy
-             image: your-registry/goproxy:1.0.0
-             ports:
-               - containerPort: 8080
-               - containerPort: 8443
-             volumeMounts:
-               - name: config
-                 mountPath: /app/config.yaml
-                 subPath: config.yaml
-               - name: tls
-                 mountPath: /etc/goproxy/tls
-                 readOnly: true
-             readinessProbe:
-               httpGet:
-                 path: /healthz
-                 port: 8080
-               initialDelaySeconds: 3
-               periodSeconds: 5
-             livenessProbe:
-               httpGet:
-                 path: /healthz
-                 port: 8080
-               initialDelaySeconds: 5
-               periodSeconds: 10
-         volumes:
-           - name: config
-             configMap:
-               name: goproxy-config
-           - name: tls
-             secret:
-               secretName: goproxy-tls
-   ---
-   apiVersion: v1
-   kind: Service
-   metadata:
-     name: goproxy
-   spec:
-     type: LoadBalancer
-     selector:
-       app: goproxy
-     ports:
-       - name: http
-         port: 80
-         targetPort: 8080
-       - name: https
-         port: 443
-         targetPort: 8443
-   ```
-
-5. **Apply the manifests:**
-
-   ```bash
-   kubectl apply -f k8s/deployment.yaml
-   kubectl rollout status deployment/goproxy
-   kubectl get svc goproxy
-   ```
-
-6. **Roll out a new version:**
-
-   ```bash
-   kubectl set image deployment/goproxy goproxy=your-registry/goproxy:1.1.0
-   kubectl rollout status deployment/goproxy
-   ```
-
-### Terraform (optional infra provisioning)
-
-For cloud-managed infrastructure (e.g., provisioning the compute
-instance, load balancer, or Kubernetes cluster that will run GoProxy),
-a minimal Terraform skeleton:
-
-```hcl
-# main.tf
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.aws_region
-}
-
-resource "aws_instance" "goproxy" {
-  ami           = var.ami_id
-  instance_type = "t3.small"
-  tags = {
-    Name = "goproxy"
-  }
-}
-
-resource "aws_security_group" "goproxy_sg" {
-  name = "goproxy-sg"
-
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 8443
-    to_port     = 8443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-```
-
-Provision:
-
-```bash
-terraform init
-terraform plan -out=plan.tfout
-terraform apply plan.tfout
-```
-
-## Operational Endpoints
-
-| Endpoint    | Description                                                        |
-|-------------|---------------------------------------------------------------------|
-| `GET /healthz` | Server liveness/readiness; reports `200` if at least one pool has a live backend (see [docs/api.md](docs/api.md)) |
-| `GET /metrics` | Basic proxy metrics (request counts, backend status)               |
-| `*` (all other paths) | Proxied to the backend pool resolved via route configuration |
-
-Full endpoint contracts, request/response shapes, and status codes are
-documented in [docs/api.md](docs/api.md).
-
-## Signals & Lifecycle
-
-- **`SIGINT` / `SIGTERM`** — triggers graceful shutdown: health-check
-  goroutines are canceled, and both HTTP and HTTPS servers are given
-  `server.shutdown_grace_seconds` to drain in-flight requests via
-  `http.Server.Shutdown`.
-- **`SIGHUP`** — reserved for future configuration reload support.
+pools:
+  - name: "web_pool"
+    strategy: "round_robin"
+    backends:
+      - url: "http://127.0.0.1:8000"
+    health_check:
+      enabled: false
+      path: "/healthz"
+      interval: "10s"
+      timeout: "2s"
+      unhealthy_threshold: 3
+      healthy_threshold: 2
