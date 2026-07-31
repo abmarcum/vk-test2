@@ -2,7 +2,9 @@
   "files": [
     {
       "path": "main.go",
-      "description": "Entry point: process lifecycle, config loading, logger construction, TLS listener setup, HTTP/HTTPS server bootstrap, mux route wiring (healthz/metrics/proxy/redirect), signal handling (SIGTERM/SIGHUP), and graceful shutdown orchestration."
+      "description": "Entry point: process lifecycle, config loading, logger construction, TLS listener setup, HTTP/HTTPS server bootstrap, mux route wiring (healthz/metrics/proxy/redirect), signal handling (SIGTERM/SIGHUP), and graceful shutdown orchestration.",
+      "tokens": 13508,
+      "costUSD": 0.003622
     },
     {
       "path": "config.go",
