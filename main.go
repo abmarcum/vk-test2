@@ -1,1 +1,3 @@
-// the /metrics endpoint against the dedicated (non-global) Prometheus
+// loading invocation, TLS listener construction, HTTP server bootstrap,
+// signal handling (SIGTERM/SIGHUP), graceful shutdown/drain, and
+// top-level wiring of Router <-> Pool <-
