@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -203,25 +204,32 @@ func (p *Pool) MarkSuccess(b *Backend) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Active health checking
+// ---------------------------------------------------------------------------
+
 // newHealthCheckClient returns a hardened HTTP client used exclusively for
-// active health probing: it does not follow redirects (redirects are
-// treated as a pass/fail signal via status code inspection instead), and
-// honors the given per-probe timeout.
+// active health probing: it does not follow redirects, and enforces a
+// minimum TLS version for HTTPS backend targets.
 func newHealthCheckClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
 	return &http.Client{
 		Timeout: timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		},
 	}
 }
 
-// joinPath joins a backend base path with a health-check probe path.
-//
-//   - If extra is empty, base is returned unchanged.
-//   - If extra is absolute (starts with "/"), it overrides base entirely.
-//   - Otherwise extra is appended to base, inserting exactly one "/"
-//     separator between them.
+// joinPath joins a backend base path with a configured health-check path.
+// An empty extra returns base unchanged; an absolute (leading "/") extra
+// overrides base entirely; otherwise the two are joined with exactly one
+// separating slash.
 func joinPath(base, extra string) string {
 	if extra == "" {
 		return base
@@ -238,33 +246,30 @@ func joinPath(base, extra string) string {
 	return base + "/" + extra
 }
 
-// RunHealthChecks runs the active health-check loop for this pool,
-// probing every backend's health_check.path on health_check.interval
-// using a timeout-bounded client, until ctx is canceled. Intended to be
-// launched as a goroutine by main().
+// RunHealthChecks runs the active health-check probe loop for this pool
+// until ctx is canceled. It probes every backend once immediately, then on
+// each tick of the configured interval.
 func (p *Pool) RunHealthChecks(ctx context.Context, logger *log.Logger) {
 	interval := p.HealthCheck.IntervalDur
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
-	timeout := p.HealthCheck.TimeoutDur
-	if timeout <= 0 {
-		timeout = 2 * time.Second
+	path := p.HealthCheck.Path
+	if path == "" {
+		path = "/healthz"
 	}
-	probePath := p.HealthCheck.Path
-	if probePath == "" {
-		probePath = "/healthz"
-	}
+	client := newHealthCheckClient(p.HealthCheck.TimeoutDur)
 
-	client := newHealthCheckClient(timeout)
-
-	probeOnce := func() {
+	probe := func() {
 		for _, b := range p.Backends {
 			target := *b.URL
-			target.Path = joinPath(b.URL.Path, probePath)
+			target.Path = joinPath(target.Path, path)
 
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 			if err != nil {
+				if logger != nil {
+					logger.Printf("ERROR health check request build failed: pool=%s backend=%s err=%v", p.Name, b.URL.Host, err)
+				}
 				p.MarkFailure(b)
 				continue
 			}
@@ -272,9 +277,6 @@ func (p *Pool) RunHealthChecks(ctx context.Context, logger *log.Logger) {
 			resp, err := client.Do(req)
 			if err != nil {
 				p.MarkFailure(b)
-				if logger != nil {
-					logger.Printf("WARN health check request failed: pool=%s backend=%s err=%v", p.Name, b.URL.Host, err)
-				}
 				continue
 			}
 			resp.Body.Close()
@@ -287,9 +289,7 @@ func (p *Pool) RunHealthChecks(ctx context.Context, logger *log.Logger) {
 		}
 	}
 
-	// Probe immediately on startup so backends aren't left in the
-	// optimistic "alive" state longer than one interval unnecessarily.
-	probeOnce()
+	probe()
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -299,7 +299,7 @@ func (p *Pool) RunHealthChecks(ctx context.Context, logger *log.Logger) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			probeOnce()
+			probe()
 		}
 	}
 }
