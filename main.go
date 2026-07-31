@@ -3,5 +3,5 @@
 // server bootstrap, mux route wiring (healthz/metrics/proxy/redirect),
 // signal handling (SIGTERM/SIGHUP), and graceful shutdown orchestration.
 //
-// This file requires Go 1.22+ at build time because it uses the
+// NOTE: This file requires Go 1.21+ at build time because it uses the
 // standard-library "log/slog" structured logging package. The module's
