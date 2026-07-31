@@ -1,4 +1,4 @@
-// header rewriting (proxy.go).
+// balancing/health-check internals (balancer.go).
 package main
 
 import (
@@ -17,3 +17,5 @@ import (
 	"syscall"
 	"time"
 )
+
+// healthCheckerAdapter bridges balancer.go's Pool state to proxy.go's
