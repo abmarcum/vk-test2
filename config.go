@@ -1,361 +1,193 @@
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"log/slog"
-	"net"
-	"net/http"
-	"net/http/httputil"
-	"sort"
-	"strings"
-	"time"
-)
-
-// compiledRoute pairs a path prefix with its resolved pool.
-type compiledRoute struct {
-	prefix string
-	pool   *Pool
+type healthCheckerAdapter struct {
+	pools map[string]*Pool
 }
 
-// Router maps path prefixes to Pools using longest-prefix-match semantics.
-type Router struct {
-	routes []compiledRoute
-}
-
-// NewRouter builds a Router from RouteConfig entries and a resolved pool
-// map, sorting routes by descending prefix length so the most specific
-// route always wins regardless of declaration order.
-func NewRouter(routes []RouteConfig, pools map[string]*Pool) (*Router, error) {
-	r := &Router{}
-	for _, rc := range routes {
-		pool, ok := pools[rc.Pool]
-		if !ok {
-			return nil, fmt.Errorf("route %q references undefined pool %q", rc.PathPrefix, rc.Pool)
-		}
-		r.routes = append(r.routes, compiledRoute{prefix: rc.PathPrefix, pool: pool})
+// AnyPoolHealthy reports true if at least one backend across any pool is
+// currently alive, or if there are no pools/backends configured at all
+// (fail-open for liveness purposes when health checking is not wired up).
+func (h *healthCheckerAdapter) AnyPoolHealthy() bool {
+	if len(h.pools) == 0 {
+		return true
 	}
-	sort.SliceStable(r.routes, func(i, j int) bool {
-		return len(r.routes[i].prefix) > len(r.routes[j].prefix)
-	})
-	return r, nil
-}
-
-// Match returns the Pool and matched prefix responsible for a request path,
-// or ok=false if no configured route matches.
-func (r *Router) Match(path string) (pool *Pool, prefix string, ok bool) {
-	for _, rt := range r.routes {
-		if strings.HasPrefix(path, rt.prefix) {
-			return rt.pool, rt.prefix, true
-		}
-	}
-	return nil, "", false
-}
-
-// proxyContextKey is the unexported context key type for request-scoped
-// proxy state.
-type proxyContextKey struct{}
-
-// proxyRequestState is stashed into the request context by the Director
-// and retrieved by ModifyResponse/ErrorHandler/logging middleware.
-type proxyRequestState struct {
-	Pool    *Pool
-	Backend *Backend
-	Route   string
-	Err     error
-
-	startTime time.Time
-	written   bool
-	status    int
-	bytesOut  int64
-}
-
-func withProxyState(r *http.Request, state *proxyRequestState) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), proxyContextKey{}, state))
-}
-
-func proxyStateFromContext(ctx context.Context) (*proxyRequestState, bool) {
-	s, ok := ctx.Value(proxyContextKey{}).(*proxyRequestState)
-	return s, ok
-}
-
-// hopHeaders lists RFC 7230 hop-by-hop headers stripped in both directions.
-var hopHeaders = []string{
-	"Connection",
-	"Proxy-Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
-}
-
-func stripHopHeaders(h http.Header) {
-	for _, hh := range hopHeaders {
-		h.Del(hh)
-	}
-}
-
-// ProxyServer wires a Router into an httputil.ReverseProxy with hardened
-// header handling, request-scoped state propagation, metrics, and logging.
-type ProxyServer struct {
-	router  *Router
-	metrics *Metrics
-	logger  *slog.Logger
-	rp      *httputil.ReverseProxy
-}
-
-// NewProxyServer constructs a ProxyServer wired to the given router.
-func NewProxyServer(router *Router, metrics *Metrics, logger *slog.Logger) *ProxyServer {
-	ps := &ProxyServer{
-		router:  router,
-		metrics: metrics,
-		logger:  logger,
-	}
-
-	transport := &http.Transport{
-		Proxy: nil, // never honor HTTP_PROXY/HTTPS_PROXY env vars
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   50,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
-		ForceAttemptHTTP2:     true,
-	}
-
-	rp := &httputil.ReverseProxy{
-		Director:       ps.buildDirector(),
-		ModifyResponse: ps.buildModifyResponse(),
-		ErrorHandler:   ps.buildErrorHandler(),
-		Transport:      transport,
-		FlushInterval:  100 * time.Millisecond,
-	}
-	ps.rp = rp
-	return ps
-}
-
-func (ps *ProxyServer) buildDirector() func(*http.Request) {
-	return func(req *http.Request) {
-		pool, route, ok := ps.router.Match(req.URL.Path)
-		if !ok {
-			state := &proxyRequestState{Route: "unmatched", Err: errNoRoute, startTime: time.Now()}
-			*req = *withProxyState(req, state)
-			req.URL.Scheme = "http"
-			req.URL.Host = ""
-			return
-		}
-
-		backend, err := pool.Choose()
-		if err != nil {
-			state := &proxyRequestState{Pool: pool, Route: route, Err: ErrNoHealthyBackends, startTime: time.Now()}
-			*req = *withProxyState(req, state)
-			req.URL.Scheme = "http"
-			req.URL.Host = ""
-			return
-		}
-
-		backend.ActiveConns.Add(1)
-		state := &proxyRequestState{Pool: pool, Backend: backend, Route: route, startTime: time.Now()}
-		*req = *withProxyState(req, state)
-
-		req.URL.Scheme = backend.URL.Scheme
-		req.URL.Host = backend.URL.Host
-		req.Host = backend.URL.Host
-
-		stripHopHeaders(req.Header)
-
-		if req.TLS != nil {
-			req.Header.Set("X-Forwarded-Proto", "https")
-		} else {
-			existing := req.Header.Get("X-Forwarded-Proto")
-			if existing != "http" && existing != "https" {
-				req.Header.Set("X-Forwarded-Proto", "http")
+	for _, p := range h.pools {
+		for _, b := range p.Backends {
+			if b.Alive.Load() {
+				return true
 			}
 		}
-		req.Header.Set("X-Forwarded-Host", req.Host)
+	}
+	return false
+}
 
-		if ip := clientIP(req.RemoteAddr); ip != "" {
-			req.Header.Add("X-Forwarded-For", ip)
-		}
-		req.Header.Set("X-Forwarded-For-Pool", pool.Name)
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 
-var errNoRoute = errors.New("no route matched")
+// run performs the full bootstrap sequence and blocks until shutdown
+// completes. Returns a non-nil error only for startup-time failures.
+func run() error {
+	configPath := flag.String("config", envOr("CONFIG_PATH", "/app/config/config.yaml"), "path to config file")
+	logLevel := flag.String("log-level", envOr("LOG_LEVEL", "info"), "log level: debug|info|warn|error")
+	flag.Parse()
 
-func clientIP(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
+	logger := newLogger(*logLevel)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	defer stop()
+
+	cfg, err := LoadConfig(ctx, *configPath)
 	if err != nil {
-		host = remoteAddr
+		return fmt.Errorf("load config: %w", err)
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.String()
-	}
-	return ""
-}
 
-func (ps *ProxyServer) buildModifyResponse() func(*http.Response) error {
-	return func(resp *http.Response) error {
-		state, ok := proxyStateFromContext(resp.Request.Context())
-		if !ok {
-			return nil
+	pools := make(map[string]*Pool, len(cfg.Pools))
+	for _, pc := range cfg.Pools {
+		pool, err := NewPool(pc)
+		if err != nil {
+			return fmt.Errorf("construct pool %q: %w", pc.Name, err)
 		}
-
-		stripHopHeaders(resp.Header)
-		resp.Header.Del("Server")
-		resp.Header.Del("X-Powered-By")
-		resp.Header.Set("X-Content-Type-Options", "nosniff")
-
-		if state.Backend != nil && state.Pool != nil {
-			state.Backend.ActiveConns.Add(-1)
-			state.Pool.MarkSuccess(state.Backend)
-		}
-
-		state.status = resp.StatusCode
-		state.bytesOut = resp.ContentLength
-		state.written = true
-
-		ps.recordAndLog(state, resp.StatusCode)
-		return nil
-	}
-}
-
-func (ps *ProxyServer) buildErrorHandler() func(http.ResponseWriter, *http.Request, error) {
-	return func(w http.ResponseWriter, r *http.Request, err error) {
-		state, ok := proxyStateFromContext(r.Context())
-		if !ok {
-			ps.writeError(w, http.StatusBadGateway, "bad gateway")
-			return
-		}
-
-		switch {
-		case errors.Is(state.Err, errNoRoute):
-			ps.writeError(w, http.StatusNotFound, "not found")
-			ps.recordAndLog(state, http.StatusNotFound)
-			return
-		case errors.Is(state.Err, ErrNoHealthyBackends):
-			ps.writeError(w, http.StatusServiceUnavailable, "service unavailable")
-			ps.recordAndLog(state, http.StatusServiceUnavailable)
-			return
-		}
-
-		if state.Backend != nil && state.Pool != nil {
-			state.Backend.ActiveConns.Add(-1)
-			state.Pool.MarkFailure(state.Backend)
-		}
-
-		status := http.StatusBadGateway
-		msg := "bad gateway"
-		if errors.Is(err, context.DeadlineExceeded) {
-			status = http.StatusGatewayTimeout
-			msg = "gateway timeout"
-		} else if errors.Is(r.Context().Err(), context.Canceled) {
-			status = 499
-			msg = "client closed request"
-		}
-
-		ps.writeError(w, status, msg)
-		ps.recordAndLog(state, status)
-	}
-}
-
-func (ps *ProxyServer) writeError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
-}
-
-func (ps *ProxyServer) recordAndLog(state *proxyRequestState, status int) {
-	poolName := "none"
-	backendName := ""
-	if state.Pool != nil {
-		poolName = state.Pool.Name
-	}
-	if state.Backend != nil {
-		backendName = state.Backend.URL.String()
+		pools[pc.Name] = pool
 	}
 
-	ps.metrics.IncCounter("goproxy_requests_total", map[string]string{
-		"route":  state.Route,
-		"pool":   poolName,
-		"status": fmt.Sprintf("%d", status),
-	})
-
-	duration := time.Since(state.startTime)
-
-	level := slog.LevelInfo
-	if status >= 500 {
-		level = slog.LevelError
-	} else if status >= 400 {
-		level = slog.LevelWarn
+	router, err := NewRouter(cfg.Routes, pools)
+	if err != nil {
+		return fmt.Errorf("construct router: %w", err)
 	}
 
-	ps.logger.Log(context.Background(), level, "proxy_request",
-		"route", state.Route,
-		"pool", poolName,
-		"backend", backendName,
-		"status", status,
-		"duration_ms", duration.Milliseconds(),
-	)
-}
+	metrics := NewMetrics()
+	proxyServer := NewProxyServer(router, metrics, logger)
+	hc := &healthCheckerAdapter{pools: pools}
 
-// ServeHTTP implements http.Handler, wrapping the underlying ReverseProxy
-// with panic-recovery.
-func (ps *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			ps.logger.Error("panic recovered", "path", r.URL.Path, "method", r.Method, "panic", fmt.Sprintf("%v", rec))
-			ps.writeError(w, http.StatusInternalServerError, "internal server error")
+	healthCtx, cancelHealth := context.WithCancel(context.Background())
+	defer cancelHealth()
+	for _, pool := range pools {
+		if pool.HealthCheckEnabled() {
+			go pool.RunHealthChecks(healthCtx, logger)
+		}
+	}
+
+	mux := NewMux(proxyServer, metrics, hc, logger)
+
+	srv := &http.Server{
+		Addr:              cfg.Server.HTTPAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
+		ReadTimeout:       cfg.Server.Timeouts.ReadDur,
+		WriteTimeout:      cfg.Server.Timeouts.WriteDur,
+		IdleTimeout:       cfg.Server.Timeouts.IdleDur,
+	}
+
+	servers := []*http.Server{srv}
+
+	go func() {
+		logger.Info("http listener starting", "addr", cfg.Server.HTTPAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("http listener failed", "error", err.Error())
 		}
 	}()
-	ps.rp.ServeHTTP(w, r)
+
+	if cfg.Server.EnableTLS {
+		tlsCfg, err := buildTLSListenerConfig(cfg.Server.TLS.CertPEM, cfg.Server.TLS.KeyPEM, cfg.Server.TLS.MinVersion)
+		if err != nil {
+			return fmt.Errorf("build tls config: %w", err)
+		}
+
+		httpsMux := NewMux(proxyServer, metrics, hc, logger)
+
+		httpsSrv := &http.Server{
+			Addr:              cfg.Server.HTTPSAddr,
+			Handler:           httpsMux,
+			TLSConfig:         tlsCfg,
+			ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
+			ReadTimeout:       cfg.Server.Timeouts.ReadDur,
+			WriteTimeout:      cfg.Server.Timeouts.WriteDur,
+			IdleTimeout:       cfg.Server.Timeouts.IdleDur,
+		}
+		servers = append(servers, httpsSrv)
+
+		go func() {
+			logger.Info("https listener starting", "addr", cfg.Server.HTTPSAddr)
+			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("https listener failed", "error", err.Error())
+			}
+		}()
+	} else {
+		logger.Warn("TLS not configured — HTTP-only mode (dev/test)")
+	}
+
+	<-ctx.Done()
+	logger.Info("shutdown signal received")
+	cancelHealth()
+
+	grace := time.Duration(cfg.Server.ShutdownGraceSeconds) * time.Second
+	gracefulShutdown(servers, grace, logger)
+
+	return nil
 }
 
-// healthChecker is the minimal interface NewMux depends on for /healthz.
-type healthChecker interface {
-	AnyPoolHealthy() bool
+// newLogger constructs a JSON slog.Logger at the requested level.
+func newLogger(level string) *slog.Logger {
+	var lvl slog.Level
+	switch level {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl})
+	return slog.New(handler)
 }
 
-// NewMux builds the top-level http.ServeMux with /healthz and /metrics
-// registered ahead of the catch-all proxy handler so they always take
-// precedence over any user-configured route.
-func NewMux(proxyServer *ProxyServer, metrics *Metrics, hc healthChecker, logger *slog.Logger) *http.ServeMux {
-	mux := http.NewServeMux()
+// envOr returns the environment variable value for key, or fallback if unset.
+func envOr(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return fallback
+}
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		if hc.AnyPoolHealthy() {
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy"})
-	})
+// buildTLSListenerConfig constructs a *tls.Config from PEM cert/key bytes,
+// enforcing the configured minimum TLS version.
+func buildTLSListenerConfig(certPEM, keyPEM []byte, minVersion string) (*tls.Config, error) {
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("load x509 key pair: %w", err)
+	}
 
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		var sb strings.Builder
-		metrics.WriteTo(&sb)
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		_, _ = w.Write([]byte(sb.String()))
-	})
+	var minVer uint16 = tls.VersionTLS12
+	if minVersion == "1.3" {
+		minVer = tls.VersionTLS13
+	}
 
-	mux.Handle("/", proxyServer)
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   minVer,
+	}, nil
+}
 
-	return mux
+// gracefulShutdown coordinates ordered teardown of all listeners: stop
+// accepting new connections and drain in-flight requests up to grace.
+func gracefulShutdown(servers []*http.Server, grace time.Duration, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, srv := range servers {
+		wg.Add(1)
+		go func(s *http.Server) {
+			defer wg.Done()
+			if err := s.Shutdown(ctx); err != nil {
+				logger.Error("graceful shutdown error", "addr", s.Addr, "error", err.Error())
+			}
+		}(srv)
+	}
+	wg.Wait()
+	logger.Info("shutdown complete")
 }
