@@ -1,67 +1,67 @@
+# Spins up the HTTP server plus two upstream backends to exercise
+# proxying + load-balancing, and a self-signed TLS cert generator.
+# =============================================================================
 version: "3.9"
 
-x-common-env: &common-env
-  LOG_LEVEL: "info"
-  HTTP_ADDR: ":8080"
-  HTTPS_ADDR: ":8443"
-  CONFIG_PATH: "/app/config/config.yaml"
-  TLS_CERT_PATH: "/app/config/tls/tls.crt"
-  TLS_KEY_PATH: "/app/config/tls/tls.key"
-
 services:
-  http-server:
+  simple-http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: "local"
-        COMMIT_SHA: "local"
+        VERSION: local-dev
     image: simple-http-server:local
     container_name: simple-http-server
     restart: unless-stopped
-    environment:
-      <<: *common-env
     ports:
-      - "8080:8080"   # HTTP / proxy entrypoint
-      - "8443:8443"   # HTTPS (TLS termination in-app)
+      - "8080:8080"   # HTTP
+      - "8443:8443"   # HTTPS
+    environment:
+      - LOG_LEVEL=debug
+      - LB_STRATEGY=round_robin
+      - UPSTREAMS=http://backend-a:80,http://backend-b:80
+      - TLS_CERT_FILE=/etc/simple-http-server/tls/server.crt
+      - TLS_KEY_FILE=/etc/simple-http-server/tls/server.key
     volumes:
-      - ./config:/app/config:ro
+      - ./config/config.yaml:/etc/simple-http-server/config.yaml:ro
+      - ./certs:/etc/simple-http-server/tls:ro
+    depends_on:
+      backend-a:
+        condition: service_healthy
+      backend-b:
+        condition: service_healthy
     networks:
       - edge
     healthcheck:
-      test: ["CMD", "/app/http-server", "--healthcheck"]
+      test: ["CMD", "/app/server", "--healthcheck"]
       interval: 15s
       timeout: 3s
-      retries: 5
+      retries: 3
       start_period: 5s
-    depends_on:
-      backend-a:
-        condition: service_started
-      backend-b:
-        condition: service_started
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 256M
-        reservations:
-          cpus: "0.25"
-          memory: 64M
 
-  # Example upstream targets for proxy/load-balancing testing
   backend-a:
-    image: hashicorp/http-echo:1.0
-    command: ["-text=response-from-backend-a", "-listen=:5678"]
+    image: hashicorp/http-echo:latest
     container_name: backend-a
+    command: ["-text=response from backend-a", "-listen=:80"]
     networks:
       - edge
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   backend-b:
-    image: hashicorp/http-echo:1.0
-    command: ["-text=response-from-backend-b", "-listen=:5678"]
+    image: hashicorp/http-echo:latest
     container_name: backend-b
+    command: ["-text=response from backend-b", "-listen=:80"]
     networks:
       - edge
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 networks:
   edge:
