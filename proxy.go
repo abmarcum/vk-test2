@@ -24,23 +24,23 @@ import (
 // Router
 // ---------------------------------------------------------------------------
 
-// routeEntry associates a path-prefix match with a resolved backend Pool.
+// routeEntry pairs a configured path-prefix match with its resolved Pool.
 type routeEntry struct {
 	prefix string
 	pool   *Pool
 }
 
-// Router resolves an inbound request path to a backend Pool using
+// Router resolves an incoming request path to a backend Pool using
 // longest-prefix-match semantics over the configured routes.
 type Router struct {
 	routes []routeEntry
 }
 
-// NewRouter builds a Router from route configs, resolving each route's pool
-// name against the supplied pools map. It fails fast if a route references
-// an unknown pool.
+// NewRouter builds a Router from the given route configs, resolving each
+// route's pool name against the provided pools map. It fails fast if any
+// route references a pool that does not exist.
 func NewRouter(routes []RouteConfig, pools map[string]*Pool) (*Router, error) {
-	r := &Router{}
+	r := &Router{routes: make([]routeEntry, 0, len(routes))}
 	for _, rc := range routes {
 		pool, ok := pools[rc.Pool]
 		if !ok {
@@ -51,22 +51,23 @@ func NewRouter(routes []RouteConfig, pools map[string]*Pool) (*Router, error) {
 	return r, nil
 }
 
-// Match returns the Pool for the longest configured route prefix matching
-// path, or nil if no route matches.
-func (r *Router) Match(path string) *Pool {
+// Match returns the Pool associated with the longest configured route
+// prefix that matches path, and true. If no route matches, it returns
+// (nil, false).
+func (r *Router) Match(path string) (*Pool, bool) {
 	var best *routeEntry
 	for i := range r.routes {
-		e := &r.routes[i]
-		if strings.HasPrefix(path, e.prefix) {
-			if best == nil || len(e.prefix) > len(best.prefix) {
-				best = e
+		entry := &r.routes[i]
+		if strings.HasPrefix(path, entry.prefix) {
+			if best == nil || len(entry.prefix) > len(best.prefix) {
+				best = entry
 			}
 		}
 	}
 	if best == nil {
-		return nil
+		return nil, false
 	}
-	return best.pool
+	return best.pool, true
 }
 
 // ---------------------------------------------------------------------------
@@ -74,8 +75,9 @@ func (r *Router) Match(path string) *Pool {
 // ---------------------------------------------------------------------------
 
 // ProxyServer is the http.Handler implementing the reverse-proxy data
-// plane: route resolution, backend selection, request forwarding via
-// httputil.ReverseProxy, and passive health/metrics recording.
+// plane: it resolves a route, selects a healthy backend via the pool's
+// load-balancing strategy, forwards the request via httputil.ReverseProxy,
+// and records passive health state + metrics based on the outcome.
 type ProxyServer struct {
 	router  *Router
 	metrics *Metrics
@@ -87,11 +89,12 @@ func NewProxyServer(router *Router, metrics *Metrics, logger *log.Logger) *Proxy
 	return &ProxyServer{router: router, metrics: metrics, logger: logger}
 }
 
+// ServeHTTP implements http.Handler.
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	pool := p.router.Match(r.URL.Path)
-	if pool == nil {
+	pool, ok := p.router.Match(r.URL.Path)
+	if !ok {
 		p.metrics.IncCounter("proxy_requests_failed_total", nil)
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -107,8 +110,8 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	backend.ActiveConns.Add(1)
 	defer backend.ActiveConns.Add(-1)
 
+	failed := false
 	isTLS := r.TLS != nil
-	origHost := r.Host
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
@@ -116,35 +119,36 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			req.URL.Host = backend.URL.Host
 			req.Host = backend.URL.Host
 
-			clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				clientIP = r.RemoteAddr
+			clientIP := req.RemoteAddr
+			if host, _, splitErr := net.SplitHostPort(req.RemoteAddr); splitErr == nil {
+				clientIP = host
 			}
 			req.Header.Set("X-Forwarded-For", clientIP)
+
 			if isTLS {
 				req.Header.Set("X-Forwarded-Proto", "https")
 			} else {
 				req.Header.Set("X-Forwarded-Proto", "http")
 			}
-			req.Header.Set("X-Forwarded-Host", origHost)
+			req.Header.Set("X-Forwarded-Host", r.Host)
 		},
-		ModifyResponse: func(resp *http.Response) error {
-			pool.MarkSuccess(backend)
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+			failed = true
 			pool.MarkFailure(backend)
 			p.metrics.IncCounter("proxy_requests_failed_total", nil)
 			if p.logger != nil {
-				p.logger.Printf("ERROR proxy upstream error backend=%s err=%v", backend.URL, err)
+				p.logger.Printf("ERROR proxy upstream error: pool=%s backend=%s err=%v", pool.Name, backend.URL.Host, err)
 			}
-			http.Error(w, "bad gateway", http.StatusBadGateway)
+			http.Error(rw, "bad gateway", http.StatusBadGateway)
 		},
 	}
 
 	proxy.ServeHTTP(w, r)
 
-	p.metrics.IncCounter("proxy_requests_total", nil)
+	if !failed {
+		pool.MarkSuccess(backend)
+		p.metrics.IncCounter("proxy_requests_total", nil)
+	}
 	p.metrics.SetGauge("proxy_last_request_duration_seconds", nil, time.Since(start).Seconds())
 }
 
@@ -165,14 +169,13 @@ func newHealthCheckerAdapter(pools []*Pool) *healthCheckerAdapter {
 	return &healthCheckerAdapter{pools: pools}
 }
 
-// Healthy reports overall liveness per the /healthz semantics described in
-// docs/api.md.
+// Healthy reports whether the process should be considered live/ready.
 func (h *healthCheckerAdapter) Healthy() bool {
 	if len(h.pools) == 0 {
 		return true
 	}
-	for _, p := range h.pools {
-		for _, b := range p.Backends {
+	for _, pool := range h.pools {
+		for _, b := range pool.Backends {
 			if b.Alive.Load() {
 				return true
 			}
@@ -185,10 +188,10 @@ func (h *healthCheckerAdapter) Healthy() bool {
 // Mux
 // ---------------------------------------------------------------------------
 
-// NewMux builds the shared http.Handler wiring /healthz, /metrics, and the
-// proxy data plane (all other paths), used by both the HTTP and HTTPS
-// listeners.
-func NewMux(proxy *ProxyServer, metrics *Metrics, hc *healthCheckerAdapter, logger *log.Logger) http.Handler {
+// NewMux builds the shared http.Handler serving /healthz, /metrics, and the
+// proxy data plane (everything else), used by both the HTTP and HTTPS
+// listeners in main.go.
+func NewMux(proxyServer *ProxyServer, metrics *Metrics, hc *healthCheckerAdapter, logger *log.Logger) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -206,10 +209,11 @@ func NewMux(proxy *ProxyServer, metrics *Metrics, hc *healthCheckerAdapter, logg
 		var sb strings.Builder
 		metrics.WriteTo(&sb)
 		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(sb.String()))
 	})
 
-	mux.Handle("/", proxy)
+	mux.Handle("/", proxyServer)
 
 	return mux
 }
