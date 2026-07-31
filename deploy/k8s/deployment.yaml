@@ -5,7 +5,7 @@ metadata:
   namespace: default
   labels:
     app: simple-http-server
-    tier: edge-proxy
+    tier: edge
 spec:
   replicas: 3
   revisionHistoryLimit: 5
@@ -21,77 +21,19 @@ spec:
     metadata:
       labels:
         app: simple-http-server
+        tier: edge
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
-      terminationGracePeriodSeconds: 30
+      serviceAccountName: simple-http-server
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
+        runAsGroup: 65532
         fsGroup: 65532
-      containers:
-        - name: httpserver
-          image: gcr.io/PROJECT_ID/simple-http-server:latest
-          imagePullPolicy: IfNotPresent
-          args:
-            - "--config=/etc/httpserver/config.yaml"
-          ports:
-            - name: http
-              containerPort: 8080
-            - name: https
-              containerPort: 8443
-            - name: metrics
-              containerPort: 9090
-          env:
-            - name: LOG_LEVEL
-              value: "info"
-            - name: LOAD_BALANCE_STRATEGY
-              value: "round_robin"
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "64Mi"
-            limits:
-              cpu: "500m"
-              memory: "256Mi"
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 3
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 10
-            periodSeconds: 15
-            timeoutSeconds: 2
-            failureThreshold: 3
-          volumeMounts:
-            - name: config
-              mountPath: /etc/httpserver/config.yaml
-              subPath: config.yaml
-              readOnly: true
-            - name: tls-certs
-              mountPath: /etc/httpserver/tls
-              readOnly: true
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-      volumes:
-        - name: config
-          configMap:
-            name: simple-http-server-config
-        - name: tls-certs
-          secret:
-            secretName: simple-http-server-tls
+      terminationGracePeriodSeconds: 30
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -102,29 +44,98 @@ spec:
                     - key: app
                       operator: In
                       values: ["simple-http-server"]
-                topologyKey: "kubernetes.io/hostname"
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: http-server
+          image: gcr.io/PROJECT_ID/simple-http-server:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config=/app/config/config.yaml"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: LOG_LEVEL
+              value: "info"
+            - name: HTTP_ADDR
+              value: ":8080"
+            - name: HTTPS_ADDR
+              value: ":8443"
+            - name: TLS_CERT_FILE
+              value: "/etc/tls/tls.crt"
+            - name: TLS_KEY_FILE
+              value: "/etc/tls/tls.key"
+            - name: LB_STRATEGY
+              value: "round_robin"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/tls
+              readOnly: true
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: simple-http-server-tls
+        - name: config
+          configMap:
+            name: simple-http-server-config
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
-kind: ConfigMap
+kind: ServiceAccount
 metadata:
-  name: simple-http-server-config
+  name: simple-http-server
   namespace: default
-data:
-  config.yaml: |
-    server:
-      http_addr: ":8080"
-      https_addr: ":8443"
-      tls:
-        cert_file: "/etc/httpserver/tls/tls.crt"
-        key_file: "/etc/httpserver/tls/tls.key"
-    load_balancer:
-      strategy: "round_robin"
-      backends:
-        - "http://backend-a:5678"
-        - "http://backend-b:5678"
-    proxy:
-      timeout: "10s"
-      max_idle_conns: 100
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -150,4 +161,18 @@ spec:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 75
+          averageUtilization: 80
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: simple-http-server-pdb
+  namespace: default
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: simple-http-server
+```
+
+---

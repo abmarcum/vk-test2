@@ -1,51 +1,78 @@
 version: "3.9"
 
 services:
-  httpserver:
+  http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: "0.1.0"
+        VERSION: "local-dev"
         COMMIT_SHA: "local"
+        BUILD_DATE: "${BUILD_DATE:-unknown}"
     image: simple-http-server:local
     container_name: simple-http-server
     restart: unless-stopped
     ports:
       - "8080:8080"   # HTTP
-      - "8443:8443"   # HTTPS / SSL termination
-    volumes:
-      - ./configs/config.yaml:/etc/httpserver/config.yaml:ro
-      - ./certs:/etc/httpserver/tls:ro
+      - "8443:8443"   # HTTPS/SSL
     environment:
       - LOG_LEVEL=info
-      - LOAD_BALANCE_STRATEGY=round_robin
+      - HTTP_ADDR=:8080
+      - HTTPS_ADDR=:8443
+      - TLS_CERT_FILE=/certs/tls.crt
+      - TLS_KEY_FILE=/certs/tls.key
+      - UPSTREAM_SERVERS=backend-a:9000,backend-b:9000
+      - LB_STRATEGY=round_robin
+    volumes:
+      - ./certs:/certs:ro
+      - ./config:/app/config:ro
+    depends_on:
+      backend-a:
+        condition: service_healthy
+      backend-b:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "/app/httpserver", "--healthcheck"]
-      interval: 15s
+      test: ["CMD", "/app/http-server", "--healthcheck"]
+      interval: 10s
       timeout: 3s
       retries: 3
       start_period: 5s
     networks:
-      - httpserver-net
+      - edge-net
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 256M
 
+  # Sample backend instances to demonstrate load balancing / proxy behavior
   backend-a:
     image: hashicorp/http-echo:1.0
-    command: ["-text=backend-a", "-listen=:5678"]
+    container_name: backend-a
+    command: ["-listen=:9000", "-text=response from backend-a"]
     networks:
-      - httpserver-net
+      - edge-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9000"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   backend-b:
     image: hashicorp/http-echo:1.0
-    command: ["-text=backend-b", "-listen=:5678"]
+    container_name: backend-b
+    command: ["-listen=:9000", "-text=response from backend-b"]
     networks:
-      - httpserver-net
+      - edge-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9000"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 networks:
-  httpserver-net:
+  edge-net:
     driver: bridge
+```
+
+---

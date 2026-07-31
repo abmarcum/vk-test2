@@ -1,47 +1,55 @@
-# syntax=docker/dockerfile:1.6
-
-########################
+# ---------------------------------------------------------------------------
 # Build stage
-########################
-FROM golang:1.22-bookworm AS builder
+# ---------------------------------------------------------------------------
+FROM golang:1.22-alpine AS builder
+
+# Build metadata (overridable via --build-arg)
+ARG VERSION=dev
+ARG COMMIT_SHA=unknown
+ARG BUILD_DATE=unknown
+
+RUN apk add --no-cache ca-certificates git tzdata
 
 WORKDIR /src
 
 # Cache go modules
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/root/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download
+RUN go mod download
 
 COPY . .
 
-ARG VERSION=dev
-ARG COMMIT_SHA=unknown
-
-RUN --mount=type=cache,target=/root/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+# Static, stripped binary for minimal attack surface
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath \
-    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT_SHA}" \
-    -o /out/httpserver ./cmd/server
+    -ldflags="-s -w \
+      -X main.version=${VERSION} \
+      -X main.commit=${COMMIT_SHA} \
+      -X main.buildDate=${BUILD_DATE}" \
+    -o /out/http-server ./cmd/server
 
-########################
-# Runtime stage
-########################
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+# ---------------------------------------------------------------------------
+# Final stage - distroless, non-root, minimal
+# ---------------------------------------------------------------------------
+FROM gcr.io/distroless/static-debian12:nonroot AS final
 
 LABEL org.opencontainers.image.title="simple-http-server" \
       org.opencontainers.image.description="Simple HTTP server with SSL, proxy, and load balancing support" \
-      org.opencontainers.image.source="https://github.com/example/simple-http-server"
+      org.opencontainers.image.source="https://github.com/org/simple-http-server" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
 
-COPY --from=builder /out/httpserver /app/httpserver
-COPY --chown=nonroot:nonroot configs/config.yaml /etc/httpserver/config.yaml
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /out/http-server /app/http-server
+COPY --from=builder /src/config/config.yaml /app/config/config.yaml
 
 USER nonroot:nonroot
 
 EXPOSE 8080 8443
 
-ENTRYPOINT ["/app/httpserver"]
-CMD ["--config=/etc/httpserver/config.yaml"]
+ENTRYPOINT ["/app/http-server"]
+CMD ["--config=/app/config/config.yaml"]
+```
+
+---

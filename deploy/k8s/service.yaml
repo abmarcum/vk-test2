@@ -33,7 +33,7 @@ metadata:
   namespace: default
 spec:
   healthCheck:
-    checkIntervalSec: 15
+    checkIntervalSec: 10
     timeoutSec: 5
     healthyThreshold: 2
     unhealthyThreshold: 3
@@ -43,6 +43,8 @@ spec:
   timeoutSec: 30
   connectionDraining:
     drainingTimeoutSec: 60
+  sessionAffinity:
+    affinityType: "CLIENT_IP"
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -53,19 +55,24 @@ metadata:
     kubernetes.io/ingress.class: "gce"
     kubernetes.io/ingress.global-static-ip-name: "simple-http-server-ip"
     networking.gke.io/managed-certificates: "simple-http-server-cert"
-    kubernetes.io/ingress.allow-http: "true"
+    networking.gke.io/v1beta1.FrontendConfig: "simple-http-server-frontendconfig"
 spec:
+  defaultBackend:
+    service:
+      name: simple-http-server
+      port:
+        number: 80
   rules:
-    - host: httpserver.example.com
+    - host: example.com
       http:
         paths:
-          - path: /*
-            pathType: ImplementationSpecific
+          - path: /
+            pathType: Prefix
             backend:
               service:
                 name: simple-http-server
                 port:
-                  number: 443
+                  number: 80
 ---
 apiVersion: networking.gke.io/v1
 kind: ManagedCertificate
@@ -74,18 +81,38 @@ metadata:
   namespace: default
 spec:
   domains:
-    - httpserver.example.com
+    - example.com
+---
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: simple-http-server-frontendconfig
+  namespace: default
+spec:
+  redirectToHttps:
+    enabled: true
+    responseCodeName: MOVED_PERMANENTLY_DEFAULT
 ```
+
+---
 
 ## deploy/terraform/main.tf
 
 ```hcl
+##############################################################################
+# Simple HTTP Server - GCP Infrastructure (GKE Autopilot + Artifact Registry)
+##############################################################################
+
 terraform {
   required_version = ">= 1.5.0"
 
   required_providers {
     google = {
       source  = "hashicorp/google"
+      version = "~> 5.30"
+    }
+    google-beta = {
+      source  = "hashicorp/google-beta"
       version = "~> 5.30"
     }
     kubernetes = {
@@ -100,130 +127,170 @@ terraform {
   }
 }
 
-#############################
+##############################################################################
 # Variables
-#############################
+##############################################################################
+
 variable "project_id" {
   description = "GCP project ID"
   type        = string
 }
 
 variable "region" {
-  description = "GCP region"
+  description = "GCP region for regional resources"
   type        = string
   default     = "us-central1"
 }
 
 variable "zone" {
-  description = "GCP zone"
+  description = "GCP zone for zonal resources"
   type        = string
   default     = "us-central1-a"
 }
 
-variable "cluster_name" {
-  description = "GKE cluster name"
+variable "environment" {
+  description = "Deployment environment (dev/staging/prod)"
   type        = string
-  default     = "simple-http-server-cluster"
+  default     = "prod"
 }
 
-variable "node_count" {
-  description = "Number of nodes per zone"
-  type        = number
-  default     = 3
+variable "app_name" {
+  description = "Application name"
+  type        = string
+  default     = "simple-http-server"
 }
 
-variable "machine_type" {
-  description = "GKE node machine type"
+variable "node_machine_type" {
+  description = "Machine type for GKE nodes (standard mode; ignored in Autopilot)"
   type        = string
   default     = "e2-standard-2"
 }
 
-variable "image_repo" {
-  description = "Artifact Registry repo name"
-  type        = string
-  default     = "simple-http-server-repo"
+variable "min_node_count" {
+  type    = number
+  default = 1
 }
 
-#############################
+variable "max_node_count" {
+  type    = number
+  default = 5
+}
+
+variable "domain" {
+  description = "Domain used for the managed SSL certificate"
+  type        = string
+  default     = "example.com"
+}
+
+##############################################################################
 # Providers
-#############################
+##############################################################################
+
 provider "google" {
   project = var.project_id
   region  = var.region
-  zone    = var.zone
 }
 
-data "google_client_config" "default" {}
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
+}
 
-#############################
+##############################################################################
+# APIs
+##############################################################################
+
+resource "google_project_service" "required" {
+  for_each = toset([
+    "container.googleapis.com",
+    "compute.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "iam.googleapis.com",
+    "certificatemanager.googleapis.com",
+    "monitoring.googleapis.com",
+    "logging.googleapis.com",
+  ])
+
+  project            = var.project_id
+  service            = each.value
+  disable_on_destroy = false
+}
+
+##############################################################################
 # Networking
-#############################
+##############################################################################
+
 resource "google_compute_network" "vpc" {
-  name                    = "simple-http-server-vpc"
+  name                    = "${var.app_name}-vpc"
   auto_create_subnetworks = false
+  depends_on              = [google_project_service.required]
 }
 
 resource "google_compute_subnetwork" "subnet" {
-  name          = "simple-http-server-subnet"
+  name          = "${var.app_name}-subnet"
   ip_cidr_range = "10.10.0.0/20"
   region        = var.region
   network       = google_compute_network.vpc.id
 
   secondary_ip_range {
     range_name    = "pods"
-    ip_cidr_range = "10.20.0.0/16"
+    ip_cidr_range = "10.20.0.0/14"
   }
 
   secondary_ip_range {
     range_name    = "services"
     ip_cidr_range = "10.30.0.0/20"
   }
+
+  private_ip_google_access = true
 }
 
+resource "google_compute_router" "router" {
+  name    = "${var.app_name}-router"
+  region  = var.region
+  network = google_compute_network.vpc.id
+}
+
+resource "google_compute_router_nat" "nat" {
+  name                               = "${var.app_name}-nat"
+  router                             = google_compute_router.router.name
+  region                             = var.region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
+
+# Reserved global static IP for the HTTPS Load Balancer / Ingress
 resource "google_compute_global_address" "lb_ip" {
-  name = "simple-http-server-ip"
+  name = "${var.app_name}-ip"
 }
 
-#############################
-# Artifact Registry
-#############################
-resource "google_artifact_registry_repository" "repo" {
-  location      = var.region
-  repository_id = var.image_repo
-  format        = "DOCKER"
-  description   = "Docker images for Simple HTTP Server"
+# Firewall: allow health checks from Google LB ranges
+resource "google_compute_firewall" "allow_health_check" {
+  name    = "${var.app_name}-allow-hc"
+  network = google_compute_network.vpc.id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["8080", "8443"]
+  }
+
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
+  target_tags   = [var.app_name]
 }
 
-#############################
-# GKE Cluster
-#############################
-resource "google_service_account" "gke_sa" {
-  account_id   = "simple-http-server-gke-sa"
-  display_name = "GKE Node Service Account - Simple HTTP Server"
-}
-
-resource "google_project_iam_member" "gke_sa_roles" {
-  for_each = toset([
-    "roles/logging.logWriter",
-    "roles/monitoring.metricWriter",
-    "roles/monitoring.viewer",
-    "roles/artifactregistry.reader",
-  ])
-  project = var.project_id
-  role    = each.value
-  member  = "serviceAccount:${google_service_account.gke_sa.email}"
-}
+##############################################################################
+# GKE Autopilot Cluster
+##############################################################################
 
 resource "google_container_cluster" "primary" {
-  name     = var.cluster_name
-  location = var.zone
-  project  = var.project_id
+  name     = "${var.app_name}-cluster"
+  location = var.region
+
+  enable_autopilot = true
 
   network    = google_compute_network.vpc.id
   subnetwork = google_compute_subnetwork.subnet.id
-
-  remove_default_node_pool = true
-  initial_node_count       = 1
 
   ip_allocation_policy {
     cluster_secondary_range_name  = "pods"
@@ -234,114 +301,93 @@ resource "google_container_cluster" "primary" {
     channel = "REGULAR"
   }
 
-  workload_identity_config {
-    workload_pool = "${var.project_id}.svc.id.goog"
-  }
+  deletion_protection = true
 
-  addons_config {
-    http_load_balancing {
-      disabled = false
-    }
-    horizontal_pod_autoscaling {
-      disabled = false
-    }
-  }
-
-  deletion_protection = false
+  depends_on = [google_project_service.required]
 }
 
-resource "google_container_node_pool" "primary_nodes" {
-  name       = "${var.cluster_name}-node-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.primary.name
-  node_count = var.node_count
+##############################################################################
+# Artifact Registry (container images)
+##############################################################################
 
-  node_config {
-    machine_type    = var.machine_type
-    service_account = google_service_account.gke_sa.email
-    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+resource "google_artifact_registry_repository" "repo" {
+  location      = var.region
+  repository_id = "${var.app_name}-repo"
+  description   = "Docker repository for ${var.app_name}"
+  format        = "DOCKER"
 
-    labels = {
-      app = "simple-http-server"
-    }
+  depends_on = [google_project_service.required]
+}
 
-    tags = ["simple-http-server-node"]
+##############################################################################
+# IAM - Workload Identity for the application service account
+##############################################################################
 
-    workload_metadata_config {
-      mode = "GKE_METADATA"
-    }
-  }
+resource "google_service_account" "app_sa" {
+  account_id   = "${var.app_name}-sa"
+  display_name = "Service Account for ${var.app_name}"
+}
 
-  autoscaling {
-    min_node_count = 2
-    max_node_count = 6
-  }
+resource "google_project_iam_member" "app_sa_monitoring" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.app_sa.email}"
+}
 
-  management {
-    auto_repair  = true
-    auto_upgrade = true
+resource "google_project_iam_member" "app_sa_logging" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.app_sa.email}"
+}
+
+resource "google_service_account_iam_member" "workload_identity_binding" {
+  service_account_id = google_service_account.app_sa.name
+  role                = "roles/iam.workloadIdentityUser"
+  member              = "serviceAccount:${var.project_id}.svc.id.goog[default/${var.app_name}]"
+}
+
+##############################################################################
+# Managed SSL Certificate (for GCE Ingress)
+##############################################################################
+
+resource "google_compute_managed_ssl_certificate" "default" {
+  name = "${var.app_name}-cert"
+
+  managed {
+    domains = [var.domain]
   }
 }
 
-#############################
-# Firewall Rules
-#############################
-resource "google_compute_firewall" "allow_lb_health_checks" {
-  name    = "allow-lb-health-checks-httpserver"
-  network = google_compute_network.vpc.id
-
-  allow {
-    protocol = "tcp"
-    ports    = ["8080", "8443", "9090"]
-  }
-
-  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
-  target_tags   = ["simple-http-server-node"]
-}
-
-resource "google_compute_firewall" "allow_internal" {
-  name    = "allow-internal-httpserver"
-  network = google_compute_network.vpc.id
-
-  allow {
-    protocol = "tcp"
-    ports    = ["0-65535"]
-  }
-  allow {
-    protocol = "udp"
-    ports    = ["0-65535"]
-  }
-
-  source_ranges = ["10.10.0.0/20", "10.20.0.0/16", "10.30.0.0/20"]
-}
-
-#############################
+##############################################################################
 # Outputs
-#############################
-output "cluster_endpoint" {
-  value       = google_container_cluster.primary.endpoint
-  sensitive   = true
-  description = "GKE cluster endpoint"
-}
+##############################################################################
 
 output "cluster_name" {
   value = google_container_cluster.primary.name
 }
 
-output "load_balancer_ip" {
-  value       = google_compute_global_address.lb_ip.address
-  description = "Static IP for the HTTP(S) Load Balancer / Ingress"
+output "cluster_endpoint" {
+  value     = google_container_cluster.primary.endpoint
+  sensitive = true
 }
 
-output "artifact_registry_repo" {
-  value = google_artifact_registry_repository.repo.name
+output "artifact_registry_url" {
+  value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.repo.repository_id}"
+}
+
+output "load_balancer_ip" {
+  value = google_compute_global_address.lb_ip.address
+}
+
+output "app_service_account_email" {
+  value = google_service_account.app_sa.email
 }
 ```
 
 ---
 
-### Notes for operators
-- Replace `PROJECT_ID`, `REPLACE_WITH_TF_STATE_BUCKET`, and `httpserver.example.com` with real values before applying.
-- TLS certs for local/docker-compose runs should be placed in `./certs` (`tls.crt`, `tls.key`); in GKE, TLS is terminated at the Ingress via `ManagedCertificate`, or optionally at the pod level using the `simple-http-server-tls` Kubernetes Secret for end-to-end encryption.
-- CI/CD should push images to `gcr.io/PROJECT_ID/simple-http-server` or the Artifact Registry repo created in Terraform, then update the Deployment image tag (recommend Kustomize or `kubectl set image` in the pipeline).
-- The HPA and node pool autoscaler provide load-based horizontal scaling in front of the app-level load balancing performed by the Go server itself.
+### Notes for Operators
+- Replace `PROJECT_ID`, `REPLACE_WITH_TF_STATE_BUCKET`, and `example.com` with real values before applying.
+- `deploy/k8s/deployment.yaml` expects `simple-http-server-tls` Secret and `simple-http-server-config` ConfigMap to be provisioned separately (e.g., via `cert-manager` or `kubectl create secret tls`).
+- The Ingress uses GCE's native load balancing (`kubernetes.io/ingress.class: gce`) to satisfy the "load balancing" requirement at the edge, while the Go app itself can also perform L7 proxying/LB to upstream services as per its design.
+- Run `terraform plan` before `apply`; `deletion_protection = true` is set on the cluster to prevent accidental destroys in prod.
