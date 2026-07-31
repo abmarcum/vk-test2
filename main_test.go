@@ -2,22 +2,24 @@ package main
 
 import "testing"
 
+type joinPathCase struct {
+	name  string
+	base  string
+	extra string
+	want  string
+}
+
 // TestJoinPath exercises the health-check path-joining helper in
 // balancer.go, providing minimal coverage so the test binary compiles and
 // runs cleanly alongside the rest of the package.
 func TestJoinPath(t *testing.T) {
-	cases := []struct {
-		name  string
-		base  string
-		extra string
-		want  string
-	}{
-		{"empty base absolute extra", "", "/healthz", "/healthz"},
-		{"root base relative extra", "/", "healthz", "/healthz"},
-		{"non-slash base relative extra", "/api", "healthz", "/api/healthz"},
-		{"slash-terminated base relative extra", "/api/", "healthz", "/api/healthz"},
-		{"absolute extra overrides base", "/api", "/healthz", "/healthz"},
-		{"empty extra returns base", "/api", "", "/api"},
+	cases := []joinPathCase{
+		{name: "empty base absolute extra", base: "", extra: "/healthz", want: "/healthz"},
+		{name: "root base relative extra", base: "/", extra: "healthz", want: "/healthz"},
+		{name: "non-slash base relative extra", base: "/api", extra: "healthz", want: "/api/healthz"},
+		{name: "slash-terminated base relative extra", base: "/api/", extra: "healthz", want: "/api/healthz"},
+		{name: "absolute extra overrides base", base: "/api", extra: "/healthz", want: "/healthz"},
+		{name: "empty extra returns base", base: "/api", extra: "", want: "/api"},
 	}
 
 	for _, c := range cases {

@@ -1,175 +1,52 @@
 # GoProxy
 
-GoProxy is a simple, production-grade HTTP/HTTPS server written in Go that
-supports:
+A simple, dependency-free HTTP/HTTPS reverse proxy with TLS termination,
+path-based routing, and load balancing across upstream backend pools —
+written entirely in the Go standard library.
 
-- **TLS termination** (HTTP and HTTPS listeners, TLS 1.2/1.3)
-- **Reverse proxying** to configurable upstream backend pools
-- **Load balancing** across backends (round-robin, least-connections, random)
-- **Active health checks** (periodic probing with hysteresis-based
-  alive/dead flipping)
-- **Passive health checks** (failure/success counting on live traffic)
-- **Graceful shutdown** on `SIGINT`/`SIGTERM`
-- **Operational endpoints**: `/healthz` and `/metrics`
+## Features
 
-It is implemented entirely with the Go standard library (no third-party
-dependencies), targets **Go 1.19+**, and uses the classic `log` package
-(not `log/slog`) for maximum compatibility with older toolchains.
-
----
-
-## Table of Contents
-
-- [Architecture Overview](#architecture-overview)
-- [Project Layout](#project-layout)
-- [Prerequisites](#prerequisites)
-- [Build Instructions](#build-instructions)
-- [Configuration](#configuration)
-- [Running Locally](#running-locally)
-- [Deployment Instructions](#deployment-instructions)
-  - [Docker](#docker)
-  - [Docker Compose](#docker-compose)
-  - [Kubernetes](#kubernetes)
-  - [Terraform (optional infra provisioning)](#terraform-optional-infra-provisioning)
-- [Operational Endpoints](#operational-endpoints)
-- [Signals & Lifecycle](#signals--lifecycle)
-- [License & Documentation](#license--documentation)
-
----
+- **HTTP & HTTPS listeners** — run plaintext HTTP, TLS-terminated HTTPS, or
+  both simultaneously, sharing a single routing/proxy handler.
+- **Path-prefix routing** — map URL path prefixes to named upstream pools
+  (longest-prefix-match).
+- **Load balancing strategies** — `round_robin` (default),
+  `least_connections`, and `random`.
+- **Active health checks** — periodic HTTP probes per pool with
+  configurable interval/timeout and healthy/unhealthy thresholds.
+- **Passive health checks** — backends are automatically marked
+  unhealthy after consecutive proxy failures and restored after
+  consecutive successes.
+- **Graceful shutdown** — SIGINT/SIGTERM triggers a bounded drain window
+  before process exit.
+- **Operational endpoints** — `/healthz` (liveness) and `/metrics`
+  (plain-text counters/gauges).
+- **Zero third-party dependencies** — configuration is parsed with an
+  in-repo YAML subset parser; `go.mod` has no external requires.
 
 ## Architecture Overview
 
-```
-                      ┌─────────────────────────────┐
-                      │           main.go           │
-                      │  process lifecycle, signals │
-                      │  server bootstrap, shutdown │
-                      └──────────────┬──────────────┘
-                                     │
-              ┌──────────────────────┼──────────────────────┐
-              │                      │                      │
-      ┌───────▼───────┐     ┌────────▼────────┐    ┌────────▼────────┐
-      │   config.go    │     │   balancer.go   │    │    proxy.go     │
-      │ YAML/env config│     │ Pool / Backend  │    │ ReverseProxy,   │
-      │ parsing        │     │ Strategy + HC   │    │ Router, Mux,    │
-      │                │     │ loop            │    │ Metrics         │
-      └────────────────┘     └─────────────────┘    └─────────────────┘
-```
+| File          | Responsibility                                                                 |
+|---------------|----------------------------------------------------------------------------------|
+| `main.go`     | Minimal placeholder; entry point lives in `proxy.go`.                          |
+| `config.go`   | `Config` struct tree + dependency-free YAML-subset parser (`LoadConfig`).       |
+| `proxy.go`    | Process lifecycle, `Router`, `ProxyServer` (reverse-proxy handler), `Mux`, TLS/HTTP server bootstrap, signal handling, graceful shutdown. |
+| `balancer.go` | `Backend`/`Pool` state, `Strategy` implementations, active/passive health checks. |
 
-- **`main.go`** — entry point. Parses CLI flags/env vars, loads config,
-  constructs pools/router/mux, starts HTTP and (optionally) HTTPS
-  listeners, wires signal handling, and performs graceful shutdown.
-- **`config.go`** — defines `Config`, `ServerConfig`, `TLSConfig`,
-  `TimeoutsConfig`, `RouteConfig`, `PoolConfig`, `HealthCheckConfig`,
-  `BackendConfig`, and `LoadConfig(ctx, path)` which parses the on-disk
-  config file (YAML) with environment variable overrides.
-- **`balancer.go`** — `Backend` and `Pool` state, the `Strategy`
-  interface (round-robin / least-connections / random), the active
-  health-check goroutine loop, and passive failure/success accounting.
-- **`proxy.go`** — the reverse-proxy request handler, `Router`
-  (route → pool resolution), `Mux` (HTTP route wiring for `/healthz`,
-  `/metrics`, and proxied traffic), and `Metrics` collection.
-
-## Project Layout
-
-```
-.
-├── main.go        # process entry point, lifecycle, TLS/HTTP bootstrap
-├── config.go      # config structs + LoadConfig
-├── balancer.go    # Pool/Backend, Strategy, active health checks
-├── proxy.go       # ReverseProxy, Router, Mux, Metrics
-├── config.yaml    # example runtime configuration (create per environment)
-├── go.mod
-├── go.sum
-└── docs/
-    └── api.md     # HTTP API / operational endpoint reference
-```
-
-## Prerequisites
-
-- **Go 1.19 or newer** (verify with `go version`)
-- A POSIX-like build environment (Linux/macOS) or Windows with Go toolchain
-- (Optional) **Docker** 20.10+ for containerized builds/deployment
-- (Optional) **kubectl** + access to a Kubernetes cluster for K8s deployment
-- (Optional) **Terraform** 1.3+ if provisioning cloud infrastructure
-
-No external Go modules are required — the project only imports the
-standard library.
-
-## Build Instructions
-
-1. **Clone the repository**
-
-   ```bash
-   git clone https://github.com/your-org/goproxy.git
-   cd goproxy
-   ```
-
-2. **Verify Go toolchain version**
-
-   ```bash
-   go version   # must report go1.19 or higher
-   ```
-
-3. **Initialize / verify modules** (no external dependencies expected,
-   but this validates `go.mod`/`go.sum` integrity)
-
-   ```bash
-   go mod tidy
-   go mod verify
-   ```
-
-4. **Run static checks (recommended)**
-
-   ```bash
-   go vet ./...
-   gofmt -l .
-   ```
-
-5. **Build the binary**
-
-   ```bash
-   go build -o bin/goproxy .
-   ```
-
-   For a fully static binary (useful for scratch/distroless Docker images):
-
-   ```bash
-   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-     -ldflags="-s -w" \
-     -o bin/goproxy .
-   ```
-
-6. **Run the test suite** (if/when tests are added under `*_test.go`)
-
-   ```bash
-   go test ./... -v
-   ```
-
-7. **Execute the binary**
-
-   ```bash
-   ./bin/goproxy -config ./config.yaml -log-level info
-   ```
-
-   or via `go run`:
-
-   ```bash
-   go run . -config ./config.yaml
-   ```
+Request flow: incoming request → `Router.Match` (longest path-prefix) →
+`Pool.Choose` (load-balancing `Strategy`, healthy backends only) →
+`httputil.ReverseProxy` forwards to the chosen `Backend` → passive
+success/failure is recorded against the backend → `/metrics` counters
+are updated.
 
 ## Configuration
 
-GoProxy is configured via a YAML file (default path `config.yaml`,
-overridable with `-config` flag or `CONFIG_PATH` env var) and two CLI
-flags:
+GoProxy reads a YAML configuration file (path from `-config` flag or the
+`CONFIG_PATH` environment variable, default `config.yaml`). The parser
+supports a minimal YAML subset (block mappings, block sequences, scalars,
+`#` comments) — no external YAML library is required.
 
-| Flag           | Env Var       | Default        | Description                              |
-|----------------|---------------|----------------|-------------------------------------------|
-| `-config`      | `CONFIG_PATH` | `config.yaml`  | Path to the YAML configuration file       |
-| `-log-level`   | `LOG_LEVEL`   | `info`         | Accepted for CLI compatibility (currently informational; the std `log` package does not filter by level) |
-
-Example `config.yaml`:
+### Example `config.yaml`
 
 ```yaml
 server:
@@ -178,9 +55,9 @@ server:
   enable_tls: true
   shutdown_grace_seconds: 15
   tls:
-    cert_file: "/etc/goproxy/tls/server.crt"
-    key_file: "/etc/goproxy/tls/server.key"
-    min_version: "1.2"      # "1.2" or "1.3"
+    cert_file: "certs/server.crt"
+    key_file: "certs/server.key"
+    min_version: "1.2"          # "1.2" (default) or "1.3"
   timeouts:
     read_header: "5s"
     read: "15s"
@@ -188,107 +65,140 @@ server:
     idle: "60s"
 
 routes:
-  - match: "/api/"
-    pool: "api-pool"
+  - match: "/api"
+    pool: "api_pool"
   - match: "/"
-    pool: "web-pool"
+    pool: "web_pool"
 
 pools:
-  - name: "api-pool"
-    strategy: "least_connections"   # round_robin | least_connections | random
+  - name: "api_pool"
+    strategy: "round_robin"       # round_robin | least_connections | random
     backends:
-      - url: "http://10.0.1.10:9000"
-      - url: "http://10.0.1.11:9000"
+      - url: "http://10.0.0.1:9000"
+      - url: "http://10.0.0.2:9000"
     health_check:
       enabled: true
       path: "/healthz"
-      interval: "10s"
-      timeout: "2s"
       unhealthy_threshold: 3
       healthy_threshold: 2
+      interval: "10s"
+      timeout: "2s"
 
-  - name: "web-pool"
-    strategy: "round_robin"
+  - name: "web_pool"
+    strategy: "least_connections"
     backends:
-      - url: "http://10.0.2.10:8081"
-      - url: "http://10.0.2.11:8081"
-    health_check:
-      enabled: true
-      path: "/healthz"
-      interval: "10s"
-      timeout: "2s"
-      unhealthy_threshold: 3
-      healthy_threshold: 2
+      - url: "http://10.0.0.3:8000"
 ```
 
-> **Note:** `cert_file`/`key_file` are read at startup and loaded into
-> `TLSConfig.CertPEM` / `TLSConfig.KeyPEM` for the TLS listener. Ensure
-> the process has read access to these paths.
+### Configuration Reference
 
-## Running Locally
+| Key                                      | Type    | Default   | Description |
+|-------------------------------------------|---------|-----------|-------------|
+| `server.http_addr`                        | string  | `:8080`   | HTTP listener address. |
+| `server.https_addr`                       | string  | `:8443`   | HTTPS listener address. |
+| `server.enable_tls`                       | bool    | `false`   | Enables the HTTPS listener. |
+| `server.shutdown_grace_seconds`           | int     | `15`      | Max seconds to wait for in-flight requests during shutdown. |
+| `server.tls.cert_file` / `key_file`       | string  | —         | PEM cert/key paths (required if `enable_tls: true`). |
+| `server.tls.min_version`                  | string  | `1.2`     | Minimum TLS version: `1.2` or `1.3`. |
+| `server.timeouts.read_header`             | duration| `5s`      | `http.Server.ReadHeaderTimeout`. |
+| `server.timeouts.read`                    | duration| `15s`     | `http.Server.ReadTimeout`. |
+| `server.timeouts.write`                   | duration| `15s`     | `http.Server.WriteTimeout`. |
+| `server.timeouts.idle`                    | duration| `60s`     | `http.Server.IdleTimeout`. |
+| `routes[].match`                          | string  | —         | Path prefix to match. |
+| `routes[].pool`                           | string  | —         | Name of the pool to route to. |
+| `pools[].name`                            | string  | —         | Unique pool identifier, referenced by `routes[].pool`. |
+| `pools[].strategy`                        | string  | `round_robin` | `round_robin`, `least_connections`, or `random`. |
+| `pools[].backends[].url`                  | string  | —         | Upstream base URL, e.g. `http://host:port`. |
+| `pools[].health_check.enabled`            | bool    | `false`   | Enables the active health-check loop. |
+| `pools[].health_check.path`               | string  | `/healthz`| Path probed on each backend. |
+| `pools[].health_check.unhealthy_threshold`| int     | `3`       | Consecutive failures before marking a backend down. |
+| `pools[].health_check.healthy_threshold`  | int     | `2`       | Consecutive successes before restoring a backend. |
+| `pools[].health_check.interval`           | duration| `10s`     | Probe interval. |
+| `pools[].health_check.timeout`            | duration| `2s`      | Per-probe timeout. |
 
-```bash
-# Generate a self-signed cert for local testing (optional)
-mkdir -p certs
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout certs/server.key -out certs/server.crt \
-  -days 365 -subj "/CN=localhost"
+### CLI Flags / Environment Variables
 
-# Start GoProxy
-go run . -config ./config.yaml
+| Flag          | Env var       | Default        | Description |
+|---------------|---------------|----------------|-------------|
+| `-config`     | `CONFIG_PATH` | `config.yaml`  | Path to the YAML config file. |
+| `-log-level`  | `LOG_LEVEL`   | `info`         | Accepted for CLI compatibility; the stdlib `log` package used here does not implement level filtering. |
 
-# In another terminal
-curl http://localhost:8080/healthz
-curl -k https://localhost:8443/healthz
-curl http://localhost:8080/metrics
-```
+---
+
+## Build Instructions
+
+**Prerequisites:** Go 1.19 or later (no third-party modules are required —
+`go.mod` has an empty dependency graph).
+
+1. Clone the repository:
+   ```bash
+   git clone https://example.com/your-org/goproxy.git
+   cd goproxy
+   ```
+
+2. Verify the module builds and vets cleanly:
+   ```bash
+   go vet ./...
+   ```
+
+3. Run tests (if present):
+   ```bash
+   go test ./...
+   ```
+
+4. Build a native binary:
+   ```bash
+   go build -o goproxy .
+   ```
+
+5. (Optional) Cross-compile a static Linux binary for containerized
+   deployment:
+   ```bash
+   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o goproxy .
+   ```
+
+6. Run locally:
+   ```bash
+   ./goproxy -config ./config.yaml
+   ```
+
+---
 
 ## Deployment Instructions
 
-### Docker
+### 1. Docker
 
-Create a `Dockerfile` in the project root:
+**Dockerfile** (multi-stage, static binary):
 
 ```dockerfile
-# ---- build stage ----
-FROM golang:1.21-alpine AS builder
+# --- build stage ---
+FROM golang:1.21 AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/goproxy .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/goproxy .
 
-# ---- runtime stage ----
+# --- runtime stage ---
 FROM gcr.io/distroless/static-debian12
-WORKDIR /app
-COPY --from=builder /out/goproxy /app/goproxy
-COPY config.yaml /app/config.yaml
+COPY --from=build /out/goproxy /goproxy
+COPY config.yaml /config.yaml
+COPY certs/ /certs/
 EXPOSE 8080 8443
-ENTRYPOINT ["/app/goproxy", "-config", "/app/config.yaml"]
+ENTRYPOINT ["/goproxy", "-config", "/config.yaml"]
 ```
 
-Build and run the image:
+Build and run:
 
 ```bash
-# Build the Docker image
 docker build -t goproxy:latest .
-
-# Run the container (mount TLS certs and config as needed)
-docker run --rm -d \
+docker run -d \
   --name goproxy \
   -p 8080:8080 -p 8443:8443 \
-  -v "$(pwd)/config.yaml:/app/config.yaml:ro" \
-  -v "$(pwd)/certs:/etc/goproxy/tls:ro" \
+  -v $(pwd)/config.yaml:/config.yaml:ro \
+  -v $(pwd)/certs:/certs:ro \
   goproxy:latest
-
-# Verify
-curl http://localhost:8080/healthz
-docker logs -f goproxy
 ```
 
-### Docker Compose
-
-`docker-compose.yml`:
+### 2. docker-compose
 
 ```yaml
 version: "3.9"
@@ -296,38 +206,162 @@ services:
   goproxy:
     build: .
     image: goproxy:latest
-    container_name: goproxy
     ports:
       - "8080:8080"
       - "8443:8443"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      - ./certs:/etc/goproxy/tls:ro
+      - ./config.yaml:/config.yaml:ro
+      - ./certs:/certs:ro
     environment:
-      - CONFIG_PATH=/app/config.yaml
-      - LOG_LEVEL=info
+      - CONFIG_PATH=/config.yaml
     restart: unless-stopped
 ```
 
-Deploy:
-
 ```bash
-docker compose build
-docker compose up -d
-docker compose logs -f goproxy
-docker compose down   # to stop and remove
+docker-compose up -d --build
 ```
 
-### Kubernetes
+### 3. Kubernetes
 
-1. **Build and push the image** to your registry:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: goproxy-config
+data:
+  config.yaml: |
+    server:
+      http_addr: ":8080"
+      https_addr: ":8443"
+      enable_tls: true
+      tls:
+        cert_file: "/certs/tls.crt"
+        key_file: "/certs/tls.key"
+    routes:
+      - match: "/"
+        pool: "web_pool"
+    pools:
+      - name: "web_pool"
+        strategy: "round_robin"
+        backends:
+          - url: "http://web-svc:8000"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: goproxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: goproxy
+  template:
+    metadata:
+      labels:
+        app: goproxy
+    spec:
+      containers:
+        - name: goproxy
+          image: goproxy:latest
+          args: ["-config", "/etc/goproxy/config.yaml"]
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - name: config
+              mountPath: /etc/goproxy
+            - name: tls-certs
+              mountPath: /certs
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+      volumes:
+        - name: config
+          configMap:
+            name: goproxy-config
+        - name: tls-certs
+          secret:
+            secretName: goproxy-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: goproxy
+spec:
+  selector:
+    app: goproxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: https
+      port: 443
+      targetPort: 8443
+```
 
-   ```bash
-   docker build -t your-registry/goproxy:1.0.0 .
-   docker push your-registry/goproxy:1.0.0
-   ```
+Apply:
 
-2. **Create a ConfigMap** for `config.yaml`:
+```bash
+kubectl create secret tls goproxy-tls --cert=certs/server.crt --key=certs/server.key
+kubectl apply -f k8s/goproxy.yaml
+```
 
-   ```bash
-   kubectl create configmap goproxy-config \
+### 4. Terraform (container image reference example)
+
+```hcl
+resource "kubernetes_deployment" "goproxy" {
+  metadata { name = "goproxy" }
+  spec {
+    replicas = 2
+    selector { match_labels = { app = "goproxy" } }
+    template {
+      metadata { labels = { app = "goproxy" } }
+      spec {
+        container {
+          name  = "goproxy"
+          image = "your-registry/goproxy:latest"
+          port { container_port = 8080 }
+          port { container_port = 8443 }
+        }
+      }
+    }
+  }
+}
+```
+
+```bash
+terraform init
+terraform plan
+terraform apply
+```
+
+---
+
+## Operational Endpoints
+
+- `GET /healthz` — `200 ok` if at least one backend across all pools is
+  alive (or vacuously `200` if no pools configured); otherwise
+  `503 unavailable`.
+- `GET /metrics` — plain-text counters/gauges (`proxy_requests_total`,
+  `proxy_requests_failed_total`, `proxy_last_request_duration_seconds`).
+- `/*` — all other paths are matched against configured routes and
+  reverse-proxied to a healthy backend. See [API Docs](docs/api.md).
+
+## Graceful Shutdown
+
+On `SIGINT`/`SIGTERM`, GoProxy stops accepting new health-check probes,
+calls `http.Server.Shutdown` on every listener, and waits up to
+`server.shutdown_grace_seconds` for in-flight requests to complete before
+exiting.
+
+## License & Documentation
+
+[MIT License](LICENSE) | [API Docs](docs/api.md)
+
+This project is licensed under the **MIT License** — see the
+[LICENSE](LICENSE) file for the full text.
