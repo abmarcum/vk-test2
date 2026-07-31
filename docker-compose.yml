@@ -1,67 +1,60 @@
-# Brings up the HTTP server plus two upstream backends to exercise the
-# reverse-proxy and load-balancing features end to end.
-# ============================================================================
 version: "3.9"
 
 services:
-  simple-http-server:
+  http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        BUILD_VERSION: "local"
+        VERSION: local
+        COMMIT_SHA: local-dev
     image: simple-http-server:local
     container_name: simple-http-server
     restart: unless-stopped
     ports:
       - "8080:8080"   # HTTP
       - "8443:8443"   # HTTPS
-      - "9090:9090"   # Metrics / health
+      - "9090:9090"   # Metrics
     environment:
-      HTTP_ADDR: ":8080"
-      HTTPS_ADDR: ":8443"
-      METRICS_ADDR: ":9090"
-      CONFIG_PATH: "/etc/simple-http-server/config.yaml"
-      TLS_CERT_PATH: "/etc/certs/tls.crt"
-      TLS_KEY_PATH: "/etc/certs/tls.key"
-      LOG_LEVEL: "info"
+      APP_ENV: development
+      LOG_LEVEL: debug
+      TLS_CERT_FILE: /app/certs/server.crt
+      TLS_KEY_FILE: /app/certs/server.key
+      UPSTREAM_BACKENDS: "backend-a:9001,backend-b:9002"
+      LB_STRATEGY: round_robin
     volumes:
-      - ./configs/config.yaml:/etc/simple-http-server/config.yaml:ro
-      - ./certs:/etc/certs:ro
-    healthcheck:
-      test: ["CMD", "/app/simple-http-server", "healthcheck"]
-      interval: 15s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
+      - ./configs:/app/configs:ro
+      - ./certs:/app/certs:ro
     depends_on:
       backend-a:
         condition: service_started
       backend-b:
         condition: service_started
     networks:
-      - edge-net
+      - edge
+    healthcheck:
+      test: ["CMD", "/app/httpserver", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
-  # Upstream target #1 for reverse-proxy / load-balancing tests
+  # Demo upstream target #1 for reverse-proxy / load-balancing
   backend-a:
-    image: traefik/whoami:latest
+    image: hashicorp/http-echo:1.0
     container_name: backend-a
-    restart: unless-stopped
-    environment:
-      WHOAMI_NAME: "backend-a"
+    command: ["-text=response from backend-a", "-listen=:9001"]
     networks:
-      - edge-net
+      - edge
 
-  # Upstream target #2 for reverse-proxy / load-balancing tests
+  # Demo upstream target #2 for reverse-proxy / load-balancing
   backend-b:
-    image: traefik/whoami:latest
+    image: hashicorp/http-echo:1.0
     container_name: backend-b
-    restart: unless-stopped
-    environment:
-      WHOAMI_NAME: "backend-b"
+    command: ["-text=response from backend-b", "-listen=:9002"]
     networks:
-      - edge-net
+      - edge
 
 networks:
-  edge-net:
+  edge:
     driver: bridge

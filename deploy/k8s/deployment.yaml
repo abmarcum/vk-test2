@@ -1,43 +1,25 @@
-# Namespace, ConfigMap, Deployment and HorizontalPodAutoscaler for
-# Simple HTTP Server on GKE.
-# ============================================================================
 apiVersion: v1
 kind: Namespace
 metadata:
   name: simple-http-server
-  labels:
-    app.kubernetes.io/name: simple-http-server
-
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: simple-http-server-config
+  name: http-server-config
   namespace: simple-http-server
 data:
-  config.yaml: |
-    server:
-      httpAddr: ":8080"
-      httpsAddr: ":8443"
-      metricsAddr: ":9090"
-      readTimeout: 15s
-      writeTimeout: 15s
-      idleTimeout: 60s
-    tls:
-      certFile: "/etc/certs/tls.crt"
-      keyFile: "/etc/certs/tls.key"
-      minVersion: "1.2"
-    proxy:
-      upstreams:
-        - name: backend-a
-          url: "http://backend-a.simple-http-server.svc.cluster.local:80"
-        - name: backend-b
-          url: "http://backend-b.simple-http-server.svc.cluster.local:80"
-    loadBalancer:
-      strategy: "round_robin"   # round_robin | least_conn | ip_hash
-      healthCheckInterval: 10s
-      healthCheckPath: "/healthz"
-
+  APP_ENV: "production"
+  LOG_LEVEL: "info"
+  METRICS_PORT: "9090"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: http-server-sa
+  namespace: simple-http-server
+  annotations:
+    iam.gke.io/gcp-service-account: http-server-gsa@PROJECT_ID.iam.gserviceaccount.com
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -45,8 +27,8 @@ metadata:
   name: simple-http-server
   namespace: simple-http-server
   labels:
-    app.kubernetes.io/name: simple-http-server
-    app.kubernetes.io/component: edge-proxy
+    app: simple-http-server
+    tier: edge
 spec:
   replicas: 3
   revisionHistoryLimit: 5
@@ -57,20 +39,18 @@ spec:
       maxUnavailable: 0
   selector:
     matchLabels:
-      app.kubernetes.io/name: simple-http-server
+      app: simple-http-server
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: simple-http-server
-        app.kubernetes.io/component: edge-proxy
+        app: simple-http-server
+        tier: edge
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: simple-http-server
-      automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 30
+      serviceAccountName: http-server-sa
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -78,27 +58,27 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                topologyKey: kubernetes.io/hostname
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: simple-http-server
+      terminationGracePeriodSeconds: 30
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
           whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:
-              app.kubernetes.io/name: simple-http-server
+              app: simple-http-server
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: simple-http-server
+                topologyKey: kubernetes.io/hostname
       containers:
-        - name: simple-http-server
-          image: REGION-docker.pkg.dev/PROJECT_ID/simple-http-server/simple-http-server:latest
+        - name: http-server
+          image: gcr.io/PROJECT_ID/simple-http-server:latest
           imagePullPolicy: IfNotPresent
-          args: ["serve", "--config", "/etc/simple-http-server/config.yaml"]
           ports:
             - name: http
               containerPort: 8080
@@ -109,84 +89,78 @@ spec:
             - name: metrics
               containerPort: 9090
               protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: http-server-config
           env:
-            - name: LOG_LEVEL
-              value: "info"
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
+            - name: TLS_CERT_FILE
+              value: "/etc/tls/tls.crt"
+            - name: TLS_KEY_FILE
+              value: "/etc/tls/tls.key"
+            - name: LB_STRATEGY
+              value: "least_conn"
           resources:
             requests:
-              cpu: "100m"
-              memory: "64Mi"
+              cpu: 100m
+              memory: 64Mi
             limits:
-              cpu: "500m"
-              memory: "256Mi"
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 2
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            - name: config
-              mountPath: /etc/simple-http-server
-              readOnly: true
             - name: tls-certs
-              mountPath: /etc/certs
+              mountPath: /etc/tls
               readOnly: true
             - name: tmp
               mountPath: /tmp
-          startupProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            failureThreshold: 30
-            periodSeconds: 2
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 3
       volumes:
-        - name: config
-          configMap:
-            name: simple-http-server-config
         - name: tls-certs
           secret:
-            secretName: simple-http-server-tls
+            secretName: http-server-tls
         - name: tmp
           emptyDir: {}
-
 ---
-apiVersion: v1
-kind: ServiceAccount
+apiVersion: policy/v1
+kind: PodDisruptionBudget
 metadata:
-  name: simple-http-server
+  name: simple-http-server-pdb
   namespace: simple-http-server
-  annotations:
-    iam.gke.io/gcp-service-account: simple-http-server-gsa@PROJECT_ID.iam.gserviceaccount.com
-
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: simple-http-server
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: simple-http-server
+  name: simple-http-server-hpa
   namespace: simple-http-server
 spec:
   scaleTargetRef:
@@ -208,15 +182,3 @@ spec:
         target:
           type: Utilization
           averageUtilization: 75
-
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: simple-http-server-pdb
-  namespace: simple-http-server
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: simple-http-server

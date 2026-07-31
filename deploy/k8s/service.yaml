@@ -1,61 +1,83 @@
-# Internal ClusterIP service + external GCP L4 Load Balancer service
-# ============================================================================
 apiVersion: v1
 kind: Service
 metadata:
   name: simple-http-server
   namespace: simple-http-server
   labels:
-    app.kubernetes.io/name: simple-http-server
+    app: simple-http-server
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "http-server-backendconfig"}'
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: simple-http-server
+    app: simple-http-server
   ports:
     - name: http
       port: 80
-      targetPort: http
+      targetPort: 8080
       protocol: TCP
     - name: https
       port: 443
-      targetPort: https
+      targetPort: 8443
       protocol: TCP
-    - name: metrics
-      port: 9090
-      targetPort: metrics
-      protocol: TCP
-
 ---
-apiVersion: v1
-kind: Service
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
 metadata:
-  name: simple-http-server-external
+  name: http-server-backendconfig
   namespace: simple-http-server
-  labels:
-    app.kubernetes.io/name: simple-http-server
-  annotations:
-    # Regional external passthrough Network Load Balancer on GKE
-    cloud.google.com/neg: '{"exposed_ports": {"80":{},"443":{}}}'
-    networking.gke.io/load-balancer-type: "External"
-    cloud.google.com/l4-rbs: "enabled"
-    # Bind to a reserved static IP created by Terraform (see main.tf)
-    networking.gke.io/internal-load-balancer-allow-global-access: "false"
 spec:
-  type: LoadBalancer
-  loadBalancerIP: STATIC_LB_IP_ADDRESS
-  externalTrafficPolicy: Local
-  sessionAffinity: ClientIP
-  sessionAffinityConfig:
-    clientIP:
-      timeoutSeconds: 10800
-  selector:
-    app.kubernetes.io/name: simple-http-server
-  ports:
-    - name: http
-      port: 80
-      targetPort: http
-      protocol: TCP
-    - name: https
-      port: 443
-      targetPort: https
-      protocol: TCP
+  timeoutSec: 30
+  connectionDraining:
+    drainingTimeoutSec: 60
+  healthCheck:
+    checkIntervalSec: 15
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+    type: HTTP
+    requestPath: /healthz
+    port: 8080
+  securityPolicy:
+    name: "http-server-armor-policy"
+  sessionAffinity:
+    affinityType: "CLIENT_IP"
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: http-server-managed-cert
+  namespace: simple-http-server
+spec:
+  domains:
+    - example.com
+    - www.example.com
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: simple-http-server-ingress
+  namespace: simple-http-server
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: "http-server-static-ip"
+    networking.gke.io/managed-certificates: "http-server-managed-cert"
+    kubernetes.io/ingress.allow-http: "true"
+spec:
+  defaultBackend:
+    service:
+      name: simple-http-server
+      port:
+        number: 80
+  rules:
+    - host: example.com
+      http:
+        paths:
+          - path: /*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: simple-http-server
+                port:
+                  number: 80
