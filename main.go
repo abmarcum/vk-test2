@@ -1,14 +1,12 @@
 // Package main implements the GoProxy entry point: process lifecycle,
-// config loading, pool/router/proxy wiring, HTTP/HTTPS listener
-// bootstrap, active health-check goroutine startup, the `healthcheck`
-// CLI subcommand (used by the Dockerfile HEALTHCHECK instruction), and
-// graceful shutdown on SIGINT/SIGTERM.
+// config loading, TLS listener setup, HTTP/HTTPS server bootstrap, mux
+// route wiring, signal handling, graceful shutdown, and the
+// `healthcheck` CLI subcommand used by the Docker HEALTHCHECK directive.
 //
-// All other application types (Config/LoadConfig, Backend/Pool/Strategy,
-// Router/ProxyServer/Mux, Metrics) are defined in the sibling files
-// config.go, balancer.go, proxy.go, and metrics.go respectively — this
-// file intentionally does not redeclare any of them, to avoid duplicate
-// symbol definitions within the package.
+// The Config/Pool/ProxyServer/Metrics types and their supporting logic
+// live in config.go, balancer.go, proxy.go, and metrics.go respectively;
+// this file only wires them together. It intentionally does not
+// redeclare any type or function already defined in those files.
 //
 // Uses only the standard library "log" package (not "log/slog") to
 // remain compatible with Go 1.19+ build environments, and only stdlib
@@ -18,35 +16,42 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
+	"strconv"
 	"syscall"
 	"time"
 )
 
 func main() {
-	// Dedicated CLI subcommand used by the Dockerfile HEALTHCHECK
-	// instruction (`/app/http-server healthcheck`), since distroless
-	// images have no shell/curl available.
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		os.Exit(runHealthCheckCLI())
+		os.Exit(runHealthcheckCLI())
 	}
 
+	if err := run(); err != nil {
+		log.Printf("FATAL %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	configPath := flag.String("config", envOr("CONFIG_PATH", "config.yaml"), "path to YAML config file")
 	flag.Parse()
 
-	logger := log.New(os.Stdout, "", log.LstdFlags)
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 
-	loadCtx, loadCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	cfg, err := LoadConfig(loadCtx, *configPath)
-	loadCancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	cfg, err := LoadConfig(ctx, *configPath)
 	if err != nil {
-		logger.Fatalf("FATAL load config: %v", err)
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	pools := make(map[string]*Pool, len(cfg.Pools))
@@ -54,15 +59,15 @@ func main() {
 	for _, pc := range cfg.Pools {
 		pool, err := NewPool(pc)
 		if err != nil {
-			logger.Fatalf("FATAL build pool %q: %v", pc.Name, err)
+			return fmt.Errorf("build pool %q: %w", pc.Name, err)
 		}
-		pools[pc.Name] = pool
+		pools[pool.Name] = pool
 		poolList = append(poolList, pool)
 	}
 
 	router, err := NewRouter(cfg.Routes, pools)
 	if err != nil {
-		logger.Fatalf("FATAL build router: %v", err)
+		return err
 	}
 
 	metrics := NewMetrics()
@@ -70,7 +75,7 @@ func main() {
 	hc := newHealthCheckerAdapter(poolList)
 	mux := NewMux(proxyServer, metrics, hc, logger)
 
-	hcCtx, hcCancel := context.WithCancel(context.Background())
+	hcCtx, hcCancel := context.WithCancel(ctx)
 	defer hcCancel()
 	for _, pool := range poolList {
 		if pool.HealthCheckEnabled() {
@@ -78,7 +83,6 @@ func main() {
 		}
 	}
 
-	var wg sync.WaitGroup
 	var servers []*http.Server
 
 	httpSrv := &http.Server{
@@ -90,119 +94,131 @@ func main() {
 		IdleTimeout:       cfg.Server.Timeouts.IdleDur,
 	}
 	servers = append(servers, httpSrv)
-	wg.Add(1)
+
+	errCh := make(chan error, 2)
+
 	go func() {
-		defer wg.Done()
 		logger.Printf("INFO http listener starting addr=%s", cfg.Server.HTTPAddr)
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Printf("ERROR http listener failed: %v", err)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("http server: %w", err)
 		}
 	}()
 
+	var httpsSrv *http.Server
 	if cfg.Server.EnableTLS {
-		if len(cfg.Server.TLS.CertPEM) == 0 || len(cfg.Server.TLS.KeyPEM) == 0 {
-			logger.Fatalf("FATAL tls enabled but cert/key material not loaded (check server.tls.cert_file / key_file)")
-		}
-		cert, err := tls.X509KeyPair(cfg.Server.TLS.CertPEM, cfg.Server.TLS.KeyPEM)
+		tlsCfg, err := buildTLSConfig(cfg.Server.TLS)
 		if err != nil {
-			logger.Fatalf("FATAL load tls key pair: %v", err)
+			return fmt.Errorf("build tls config: %w", err)
 		}
-		minVersion := uint16(tls.VersionTLS12)
-		if cfg.Server.TLS.MinVersion == "1.3" {
-			minVersion = tls.VersionTLS13
-		}
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   minVersion,
-		}
-		httpsSrv := &http.Server{
+		httpsSrv = &http.Server{
 			Addr:              cfg.Server.HTTPSAddr,
 			Handler:           mux,
-			TLSConfig:         tlsConfig,
+			TLSConfig:         tlsCfg,
 			ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
 			ReadTimeout:       cfg.Server.Timeouts.ReadDur,
 			WriteTimeout:      cfg.Server.Timeouts.WriteDur,
 			IdleTimeout:       cfg.Server.Timeouts.IdleDur,
 		}
 		servers = append(servers, httpsSrv)
-		wg.Add(1)
+
 		go func() {
-			defer wg.Done()
 			logger.Printf("INFO https listener starting addr=%s", cfg.Server.HTTPSAddr)
-			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-				logger.Printf("ERROR https listener failed: %v", err)
+			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("https server: %w", err)
 			}
 		}()
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-	logger.Printf("INFO shutdown signal received, draining connections")
+	select {
+	case <-ctx.Done():
+		logger.Printf("INFO shutdown signal received")
+	case err := <-errCh:
+		logger.Printf("ERROR %v", err)
+	}
 
 	hcCancel()
 
-	graceSeconds := cfg.Server.ShutdownGraceSeconds
-	if graceSeconds <= 0 {
-		graceSeconds = 15
-	}
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(graceSeconds)*time.Second)
-	defer shutdownCancel()
+	grace := time.Duration(cfg.Server.ShutdownGraceSeconds) * time.Second
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
 
 	for _, srv := range servers {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Printf("ERROR graceful shutdown error: %v", err)
+			logger.Printf("ERROR graceful shutdown: %v", err)
 		}
 	}
 
-	wg.Wait()
-	logger.Printf("INFO shutdown complete")
+	return nil
 }
 
-// envOr returns the value of the named environment variable, or fallback
-// if unset/empty.
-func envOr(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
+// buildTLSConfig constructs a *tls.Config for the HTTPS listener from the
+// already-loaded certificate/key PEM material and configured minimum TLS
+// version.
+func buildTLSConfig(cfg TLSConfig) (*tls.Config, error) {
+	if len(cfg.CertPEM) == 0 || len(cfg.KeyPEM) == 0 {
+		return nil, fmt.Errorf("tls enabled but cert/key material missing (cert_file/key_file)")
+	}
+	cert, err := tls.X509KeyPair(cfg.CertPEM, cfg.KeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse tls certificate/key: %w", err)
+	}
+	minVersion := uint16(tls.VersionTLS12)
+	if cfg.MinVersion == "1.3" {
+		minVersion = tls.VersionTLS13
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   minVersion,
+	}, nil
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
 }
 
-// runHealthCheckCLI implements the `healthcheck` subcommand: it performs
-// an HTTP GET against this process's own /healthz endpoint and returns an
-// exit code of 0 (healthy) or 1 (unhealthy/unreachable), for use by the
-// Dockerfile HEALTHCHECK instruction.
-func runHealthCheckCLI() int {
-	configPath := envOr("CONFIG_PATH", "config.yaml")
+// runHealthcheckCLI implements the `healthcheck` subcommand invoked by the
+// Docker HEALTHCHECK directive: it performs an HTTP GET against this
+// process's own /healthz endpoint and returns an exit code of 0 on
+// success, 1 otherwise. It reads the listen address from the same config
+// file/flag used by the server itself.
+func runHealthcheckCLI() int {
+	fs := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
+	configPath := fs.String("config", envOr("CONFIG_PATH", "config.yaml"), "path to YAML config file")
+	_ = fs.Parse(os.Args[2:])
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
 	addr := ":8080"
-	loadCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	if cfg, err := LoadConfig(loadCtx, configPath); err == nil && cfg.Server.HTTPAddr != "" {
-		addr = cfg.Server.HTTPAddr
+	if cfg, err := LoadConfig(ctx, *configPath); err == nil {
+		if cfg.Server.HTTPAddr != "" {
+			addr = cfg.Server.HTTPAddr
+		}
 	}
-	cancel()
 
-	url := "http://127.0.0.1" + normalizeHealthAddr(addr) + "/healthz"
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		host, port = "", "8080"
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if _, err := strconv.Atoi(port); err != nil {
+		port = "8080"
+	}
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	url := fmt.Sprintf("http://%s:%s/healthz", host, port)
+	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "healthcheck request failed: %v\n", err)
 		return 1
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return 0
+	if resp.StatusCode != http.StatusOK {
+		return 1
 	}
-	fmt.Fprintf(os.Stderr, "healthcheck non-2xx status: %d\n", resp.StatusCode)
-	return 1
-}
-
-// normalizeHealthAddr ensures addr has a leading ":" host-less port form
-// suitable for appending to "http://127.0.0.1".
-func normalizeHealthAddr(addr string) string {
-	if addr == "" {
-		return ":8080"
-	}
-	return addr
+	return 0
 }
