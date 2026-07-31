@@ -39,8 +39,6 @@ spec:
   timeoutSec: 30
   connectionDraining:
     drainingTimeoutSec: 60
-  sessionAffinity:
-    affinityType: "CLIENT_IP"
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -51,15 +49,15 @@ metadata:
     kubernetes.io/ingress.class: "gce"
     kubernetes.io/ingress.global-static-ip-name: "simple-http-server-ip"
     networking.gke.io/managed-certificates: "simple-http-server-cert"
-    kubernetes.io/ingress.allow-http: "false"
+    kubernetes.io/ingress.allow-http: "true"
 spec:
   defaultBackend:
     service:
       name: simple-http-server
       port:
-        number: 443
+        number: 80
   rules:
-    - host: http-server.example.com
+    - host: api.example.com
       http:
         paths:
           - path: /*
@@ -77,7 +75,7 @@ metadata:
   namespace: default
 spec:
   domains:
-    - http-server.example.com
+    - api.example.com
 ```
 
 ---
@@ -97,11 +95,15 @@ terraform {
       source  = "hashicorp/google-beta"
       version = "~> 5.30"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.27"
+    }
   }
 
   backend "gcs" {
-    bucket = "REPLACE_WITH_TF_STATE_BUCKET"
-    prefix = "simple-http-server/state"
+    bucket = "simple-http-server-tfstate"
+    prefix = "terraform/state"
   }
 }
 
@@ -120,7 +122,7 @@ variable "region" {
 }
 
 variable "zone" {
-  description = "GCP zone for zonal resources"
+  description = "GCP zone"
   type        = string
   default     = "us-central1-a"
 }
@@ -131,22 +133,9 @@ variable "cluster_name" {
   default     = "simple-http-server-cluster"
 }
 
-variable "environment" {
-  description = "Deployment environment tag"
-  type        = string
-  default     = "production"
-}
-
-variable "static_ip_name" {
-  description = "Global static IP name for HTTPS Load Balancer / Ingress"
-  type        = string
-  default     = "simple-http-server-ip"
-}
-
 variable "node_machine_type" {
-  description = "GKE node machine type"
-  type        = string
-  default     = "e2-standard-2"
+  type    = string
+  default = "e2-standard-2"
 }
 
 variable "min_node_count" {
@@ -157,6 +146,12 @@ variable "min_node_count" {
 variable "max_node_count" {
   type    = number
   default = 6
+}
+
+variable "image_tag" {
+  description = "Docker image tag to deploy"
+  type        = string
+  default     = "latest"
 }
 
 ############################
@@ -172,22 +167,12 @@ provider "google-beta" {
   region  = var.region
 }
 
-############################
-# APIs
-############################
-resource "google_project_service" "required_apis" {
-  for_each = toset([
-    "container.googleapis.com",
-    "artifactregistry.googleapis.com",
-    "compute.googleapis.com",
-    "cloudresourcemanager.googleapis.com",
-    "iam.googleapis.com",
-    "logging.googleapis.com",
-    "monitoring.googleapis.com",
-  ])
-  project            = var.project_id
-  service            = each.value
-  disable_on_destroy = false
+data "google_client_config" "default" {}
+
+provider "kubernetes" {
+  host                   = "https://${google_container_cluster.primary.endpoint}"
+  token                  = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(google_container_cluster.primary.master_auth[0].cluster_ca_certificate)
 }
 
 ############################
@@ -196,35 +181,33 @@ resource "google_project_service" "required_apis" {
 resource "google_compute_network" "vpc" {
   name                    = "simple-http-server-vpc"
   auto_create_subnetworks = false
-  depends_on              = [google_project_service.required_apis]
 }
 
 resource "google_compute_subnetwork" "subnet" {
-  name          = "simple-http-server-subnet"
-  ip_cidr_range = "10.10.0.0/20"
-  region        = var.region
-  network       = google_compute_network.vpc.id
+  name                     = "simple-http-server-subnet"
+  ip_cidr_range            = "10.10.0.0/20"
+  region                   = var.region
+  network                  = google_compute_network.vpc.id
+  private_ip_google_access = true
 
   secondary_ip_range {
-    range_name    = "gke-pods"
-    ip_cidr_range = "10.20.0.0/16"
+    range_name    = "pods"
+    ip_cidr_range = "10.20.0.0/14"
   }
 
   secondary_ip_range {
-    range_name    = "gke-services"
+    range_name    = "services"
     ip_cidr_range = "10.30.0.0/20"
   }
-
-  private_ip_google_access = true
 }
 
-resource "google_compute_global_address" "lb_static_ip" {
-  name = var.static_ip_name
+resource "google_compute_global_address" "lb_ip" {
+  name = "simple-http-server-ip"
 }
 
 resource "google_compute_firewall" "allow_health_checks" {
-  name    = "allow-gcp-health-checks"
-  network = google_compute_network.vpc.name
+  name    = "allow-gclb-health-checks"
+  network = google_compute_network.vpc.id
 
   allow {
     protocol = "tcp"
@@ -236,34 +219,22 @@ resource "google_compute_firewall" "allow_health_checks" {
 }
 
 ############################
-# Artifact Registry
-############################
-resource "google_artifact_registry_repository" "repo" {
-  location      = var.region
-  repository_id = "simple-http-server-repo"
-  description   = "Container images for simple-http-server"
-  format        = "DOCKER"
-  depends_on    = [google_project_service.required_apis]
-}
-
-############################
-# GKE Cluster (Standard, VPC-native)
+# GKE Cluster
 ############################
 resource "google_container_cluster" "primary" {
   name     = var.cluster_name
   location = var.zone
   project  = var.project_id
 
+  network    = google_compute_network.vpc.id
+  subnetwork = google_compute_subnetwork.subnet.id
+
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  network    = google_compute_network.vpc.name
-  subnetwork = google_compute_subnetwork.subnet.name
-
-  networking_mode = "VPC_NATIVE"
   ip_allocation_policy {
-    cluster_secondary_range_name  = "gke-pods"
-    services_secondary_range_name = "gke-services"
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
   }
 
   release_channel {
@@ -272,15 +243,6 @@ resource "google_container_cluster" "primary" {
 
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
-  }
-
-  addons_config {
-    http_load_balancing {
-      disabled = false
-    }
-    horizontal_pod_autoscaling {
-      disabled = false
-    }
   }
 
   private_cluster_config {
@@ -292,23 +254,27 @@ resource "google_container_cluster" "primary" {
   master_authorized_networks_config {
     cidr_blocks {
       cidr_block   = "0.0.0.0/0"
-      display_name = "all (restrict-in-prod)"
+      display_name = "all (restrict in production)"
     }
   }
 
-  logging_service    = "logging.googleapis.com/kubernetes"
-  monitoring_service  = "monitoring.googleapis.com/kubernetes"
+  addons_config {
+    http_load_balancing {
+      disabled = false
+    }
+    horizontal_pod_autoscaling {
+      disabled = false
+    }
+  }
 
-  deletion_protection = true
-
-  depends_on = [google_project_service.required_apis]
+  deletion_protection = false
 }
 
 resource "google_container_node_pool" "primary_nodes" {
-  name       = "${var.cluster_name}-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.primary.name
-  project    = var.project_id
+  name     = "${var.cluster_name}-node-pool"
+  location = var.zone
+  cluster  = google_container_cluster.primary.name
+  project  = var.project_id
 
   autoscaling {
     min_node_count = var.min_node_count
@@ -318,11 +284,6 @@ resource "google_container_node_pool" "primary_nodes" {
   node_config {
     machine_type = var.node_machine_type
     tags         = ["gke-node", "simple-http-server"]
-
-    labels = {
-      app         = "simple-http-server"
-      environment = var.environment
-    }
 
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform",
@@ -336,6 +297,10 @@ resource "google_container_node_pool" "primary_nodes" {
       enable_secure_boot          = true
       enable_integrity_monitoring = true
     }
+
+    labels = {
+      app = "simple-http-server"
+    }
   }
 
   management {
@@ -345,25 +310,48 @@ resource "google_container_node_pool" "primary_nodes" {
 }
 
 ############################
-# Workload Identity IAM Binding
+# Artifact Registry
 ############################
-resource "google_service_account" "workload_sa" {
-  account_id   = "simple-http-server-wi"
-  display_name = "Simple HTTP Server Workload Identity SA"
+resource "google_artifact_registry_repository" "repo" {
+  location      = var.region
+  repository_id = "simple-http-server"
+  description   = "Docker repo for simple-http-server"
+  format        = "DOCKER"
 }
 
-resource "google_service_account_iam_binding" "wi_binding" {
-  service_account_id = google_service_account.workload_sa.name
-  role                = "roles/iam.workloadIdentityUser"
-  members = [
-    "serviceAccount:${var.project_id}.svc.id.goog[default/simple-http-server-sa]",
-  ]
+############################
+# Static IP + DNS (optional)
+############################
+resource "google_dns_managed_zone" "zone" {
+  count       = 0 # enable if managing DNS via Terraform
+  name        = "example-zone"
+  dns_name    = "example.com."
+  description = "Managed zone for simple-http-server"
 }
 
-resource "google_project_iam_member" "artifact_reader" {
+############################
+# IAM: Workload Identity binding
+############################
+resource "google_service_account" "app_sa" {
+  account_id   = "simple-http-server-sa"
+  display_name = "Simple HTTP Server Service Account"
+}
+
+resource "google_project_iam_member" "app_sa_roles" {
+  for_each = toset([
+    "roles/logging.logWriter",
+    "roles/monitoring.metricWriter",
+    "roles/monitoring.viewer",
+  ])
   project = var.project_id
-  role    = "roles/artifactregistry.reader"
-  member  = "serviceAccount:${google_service_account.workload_sa.email}"
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.app_sa.email}"
+}
+
+resource "google_service_account_iam_member" "workload_identity_binding" {
+  service_account_id = google_service_account.app_sa.name
+  role                = "roles/iam.workloadIdentityUser"
+  member              = "serviceAccount:${var.project_id}.svc.id.goog[default/simple-http-server]"
 }
 
 ############################
@@ -378,24 +366,23 @@ output "cluster_endpoint" {
   sensitive = true
 }
 
+output "load_balancer_ip" {
+  value = google_compute_global_address.lb_ip.address
+}
+
 output "artifact_registry_repo" {
   value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.repo.repository_id}"
 }
 
-output "lb_static_ip_address" {
-  value = google_compute_global_address.lb_static_ip.address
-}
-
-output "vpc_network" {
-  value = google_compute_network.vpc.name
+output "service_account_email" {
+  value = google_service_account.app_sa.email
 }
 ```
 
 ---
 
-### Deployment Notes
-
-1. **Build & Push:** `docker build -t us-docker.pkg.dev/$PROJECT_ID/simple-http-server-repo/simple-http-server:latest . && docker push ...`
-2. **Terraform:** `terraform init && terraform apply -var="project_id=$PROJECT_ID"` provisions the VPC, GKE cluster, Artifact Registry, static IP, and Workload Identity bindings.
-3. **K8s Apply Order:** `kubectl apply -f deploy/k8s/deployment.yaml -f deploy/k8s/service.yaml` — the Ingress provisions a GCP HTTPS Load Balancer bound to the reserved static IP, with `ManagedCertificate` handling SSL via Google-managed certs (app-level TLS in `docker-compose.yml`/local dev covers edge SSL termination in non-GKE environments).
-4. **Secrets:** Populate `simple-http-server-tls` Secret (`kubectl create secret tls`) only if terminating TLS at the pod level instead of the GCP LB.
+### Notes for Operationalization
+- **SSL:** `ManagedCertificate` handles TLS at the GCLB layer; the app-level TLS via `http-server-tls` secret supports mTLS/direct HTTPS use cases if bypassing the LB.
+- **Proxy/LB:** Upstream targets injected via ConfigMap (`PROXY_UPSTREAMS`), consumed by the Go binary's reverse proxy/load-balancing logic (`LB_STRATEGY` supports `round_robin`, extendable to `least_conn`/`ip_hash`).
+- **Scaling:** HPA (CPU-based) + GKE node pool autoscaling + PDB ensure resilient rolling updates.
+- **Before applying Terraform:** replace `PROJECT_ID` in `deployment.yaml`, set `var.project_id`, create the `simple-http-server-tfstate` GCS bucket, and update `api.example.com` domain references.

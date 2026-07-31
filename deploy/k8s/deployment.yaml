@@ -5,8 +5,7 @@ metadata:
   namespace: default
   labels:
     app: simple-http-server
-    app.kubernetes.io/name: simple-http-server
-    app.kubernetes.io/part-of: simple-http-server
+    tier: edge
 spec:
   replicas: 3
   revisionHistoryLimit: 5
@@ -27,39 +26,41 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: simple-http-server-sa
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
-        runAsGroup: 65532
         fsGroup: 65532
       containers:
         - name: simple-http-server
-          image: us-docker.pkg.dev/PROJECT_ID/simple-http-server-repo/simple-http-server:latest
+          image: gcr.io/PROJECT_ID/simple-http-server:latest
           imagePullPolicy: IfNotPresent
+          args:
+            - "--config=/app/config/config.yaml"
           ports:
             - name: http
               containerPort: 8080
-              protocol: TCP
             - name: https
               containerPort: 8443
-              protocol: TCP
           env:
-            - name: PORT
-              value: "8080"
-            - name: TLS_PORT
-              value: "8443"
-            - name: TLS_CERT_FILE
+            - name: APP_ENV
+              value: "production"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: TLS_CERT_PATH
               value: "/etc/tls/tls.crt"
-            - name: TLS_KEY_FILE
+            - name: TLS_KEY_PATH
               value: "/etc/tls/tls.key"
+            - name: PROXY_UPSTREAMS
+              valueFrom:
+                configMapKeyRef:
+                  name: simple-http-server-config
+                  key: proxy_upstreams
             - name: LB_STRATEGY
-              value: "round_robin"
-            - name: CONFIG_PATH
-              value: "/app/config/config.yaml"
-          envFrom:
-            - configMapRef:
-                name: simple-http-server-config
+              valueFrom:
+                configMapKeyRef:
+                  name: simple-http-server-config
+                  key: lb_strategy
           resources:
             requests:
               cpu: "100m"
@@ -75,7 +76,7 @@ spec:
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8080
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 2
@@ -83,7 +84,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8080
+              port: http
             initialDelaySeconds: 3
             periodSeconds: 5
             timeoutSeconds: 2
@@ -91,14 +92,14 @@ spec:
           startupProbe:
             httpGet:
               path: /healthz
-              port: 8080
-            periodSeconds: 5
-            failureThreshold: 12
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
           volumeMounts:
             - name: tls-certs
               mountPath: /etc/tls
               readOnly: true
-            - name: app-config
+            - name: config-volume
               mountPath: /app/config
               readOnly: true
             - name: tmp
@@ -106,20 +107,23 @@ spec:
       volumes:
         - name: tls-certs
           secret:
-            secretName: simple-http-server-tls
-            optional: true
-        - name: app-config
+            secretName: http-server-tls
+        - name: config-volume
           configMap:
             name: simple-http-server-config
         - name: tmp
           emptyDir: {}
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: simple-http-server
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["simple-http-server"]
+                topologyKey: "kubernetes.io/hostname"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -127,20 +131,26 @@ metadata:
   name: simple-http-server-config
   namespace: default
 data:
+  proxy_upstreams: "backend-a.default.svc.cluster.local:9001,backend-b.default.svc.cluster.local:9002"
+  lb_strategy: "round_robin"
   config.yaml: |
     server:
-      lb_strategy: round_robin
-      upstreams:
-        - name: backend-a
-          address: backend-a.default.svc.cluster.local:9001
-        - name: backend-b
-          address: backend-b.default.svc.cluster.local:9002
+      httpAddr: ":8080"
+      httpsAddr: ":8443"
+    proxy:
+      strategy: round_robin
+      healthCheckInterval: 10s
 ---
-apiVersion: v1
-kind: ServiceAccount
+apiVersion: policy/v1
+kind: PodDisruptionBudget
 metadata:
-  name: simple-http-server-sa
+  name: simple-http-server-pdb
   namespace: default
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: simple-http-server
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -161,17 +171,6 @@ spec:
         target:
           type: Utilization
           averageUtilization: 65
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: simple-http-server-pdb
-  namespace: default
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels:
-      app: simple-http-server
 ```
 
 ---

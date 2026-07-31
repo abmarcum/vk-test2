@@ -1,55 +1,48 @@
 # syntax=docker/dockerfile:1.6
 
 ########################
-# Build stage
+# Stage 1: Build
 ########################
 FROM golang:1.22-bookworm AS builder
 
 WORKDIR /src
 
-# Leverage build cache for modules
+# Cache go modules
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 
+# Copy source
 COPY . .
 
-ARG VERSION=dev
-ARG COMMIT_SHA=unknown
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+ENV CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
 
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go build \
-      -trimpath \
-      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT_SHA}" \
-      -o /out/server \
-      ./cmd/server
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -ldflags="-s -w -X main.version=$(git describe --tags --always 2>/dev/null || echo dev)" \
+    -o /out/simple-http-server ./cmd/server
 
 ########################
-# Runtime stage
+# Stage 2: Runtime
 ########################
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
-LABEL org.opencontainers.label-schema.name="simple-http-server" \
-      org.opencontainers.label-schema.vendor="Principal-SRE" \
-      org.opencontainers.label-schema.description="Simple HTTP server with SSL, proxy, and load balancing support"
+LABEL org.opencontainers.image.title="simple-http-server" \
+      org.opencontainers.image.description="Simple HTTP server with SSL, proxy, and load balancing support" \
+      org.opencontainers.image.vendor="engineering" \
+      org.opencontainers.image.source="https://github.com/org/simple-http-server"
 
 WORKDIR /app
 
-COPY --from=builder /out/server /app/server
-COPY --chown=nonroot:nonroot config/config.yaml /app/config/config.yaml
+COPY --from=builder /out/simple-http-server /app/simple-http-server
+COPY --chown=nonroot:nonroot config/ /app/config/
 
-# Non-root, read-only friendly
 USER nonroot:nonroot
 
 EXPOSE 8080 8443
 
-ENV PORT=8080 \
-    CONFIG_PATH=/app/config/config.yaml
-
-ENTRYPOINT ["/app/server"]
-CMD ["--config", "/app/config/config.yaml"]
+ENTRYPOINT ["/app/simple-http-server"]
+CMD ["--config=/app/config/config.yaml"]
 ```
 
 ---
