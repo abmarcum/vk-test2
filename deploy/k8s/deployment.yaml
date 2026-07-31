@@ -2,24 +2,32 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: simple-http-server
+  labels:
+    app.kubernetes.io/name: simple-http-server
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: http-server-config
+  name: simple-http-server-config
   namespace: simple-http-server
 data:
-  APP_ENV: "production"
-  LOG_LEVEL: "info"
-  METRICS_PORT: "9090"
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: http-server-sa
-  namespace: simple-http-server
-  annotations:
-    iam.gke.io/gcp-service-account: http-server-gsa@PROJECT_ID.iam.gserviceaccount.com
+  config.yaml: |
+    server:
+      httpPort: 8080
+      httpsPort: 8443
+      readTimeout: 15s
+      writeTimeout: 15s
+      idleTimeout: 60s
+    loadBalancer:
+      strategy: round_robin
+      upstreams:
+        - name: backend-a
+          url: http://backend-a.simple-http-server.svc.cluster.local:5678
+        - name: backend-b
+          url: http://backend-b.simple-http-server.svc.cluster.local:5678
+    proxy:
+      enableXForwardedFor: true
+      trustProxyHeaders: true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -28,7 +36,6 @@ metadata:
   namespace: simple-http-server
   labels:
     app: simple-http-server
-    tier: edge
 spec:
   replicas: 3
   revisionHistoryLimit: 5
@@ -44,61 +51,33 @@ spec:
     metadata:
       labels:
         app: simple-http-server
-        tier: edge
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "9090"
+        prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: http-server-sa
+      serviceAccountName: simple-http-server
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
-        runAsGroup: 65532
         fsGroup: 65532
-        seccompProfile:
-          type: RuntimeDefault
-      terminationGracePeriodSeconds: 30
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: simple-http-server
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app: simple-http-server
-                topologyKey: kubernetes.io/hostname
       containers:
-        - name: http-server
-          image: gcr.io/PROJECT_ID/simple-http-server:latest
+        - name: simple-http-server
+          image: us-docker.pkg.dev/PROJECT_ID/simple-http-server-repo/simple-http-server:latest
           imagePullPolicy: IfNotPresent
+          args: ["--config", "/app/config/config.yaml"]
           ports:
             - name: http
               containerPort: 8080
-              protocol: TCP
             - name: https
               containerPort: 8443
-              protocol: TCP
-            - name: metrics
-              containerPort: 9090
-              protocol: TCP
-          envFrom:
-            - configMapRef:
-                name: http-server-config
           env:
-            - name: TLS_CERT_FILE
+            - name: SERVER_LOG_LEVEL
+              value: "info"
+            - name: SERVER_TLS_CERT
               value: "/etc/tls/tls.crt"
-            - name: TLS_KEY_FILE
+            - name: SERVER_TLS_KEY
               value: "/etc/tls/tls.key"
-            - name: LB_STRATEGY
-              value: "least_conn"
           resources:
             requests:
               cpu: 100m
@@ -106,45 +85,58 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 15
-            timeoutSeconds: 3
-            failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: 8080
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
-          startupProbe:
-            httpGet:
-              path: /healthz
-              port: 8080
-            failureThreshold: 30
-            periodSeconds: 2
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
             - name: tls-certs
               mountPath: /etc/tls
               readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: config
+          configMap:
+            name: simple-http-server-config
         - name: tls-certs
           secret:
-            secretName: http-server-tls
+            secretName: simple-http-server-tls
         - name: tmp
           emptyDir: {}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: simple-http-server
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: simple-http-server
+  namespace: simple-http-server
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -175,10 +167,10 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 65
+          averageUtilization: 70
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 75
+          averageUtilization: 80

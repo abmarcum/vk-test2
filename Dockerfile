@@ -1,48 +1,47 @@
-# syntax=docker/dockerfile:1.7
-
-# ============================================================================
-# Build Stage
-# ============================================================================
+# syntax=docker/dockerfile:1.6
+############################################
+# Build stage
+############################################
 FROM golang:1.22-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates tzdata && update-ca-certificates
 
 WORKDIR /src
 
-# Leverage layer caching for dependencies
+# Leverage build cache for dependencies
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 
 ARG VERSION=dev
-ARG COMMIT_SHA=unknown
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
 
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -trimpath \
-    -ldflags="-s -w -X main.Version=${VERSION} -X main.CommitSHA=${COMMIT_SHA}" \
-    -o /out/httpserver ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
+    -o /out/simple-http-server ./cmd/server
 
-# ============================================================================
-# Runtime Stage (distroless, non-root, no shell)
-# ============================================================================
+############################################
+# Runtime stage (distroless, non-root)
+############################################
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
 LABEL org.opencontainers.image.title="simple-http-server" \
-      org.opencontainers.image.description="Simple HTTP server with SSL termination, reverse proxy and load balancing" \
+      org.opencontainers.image.description="Simple HTTP server supporting SSL termination, reverse proxying and load balancing" \
       org.opencontainers.image.source="https://github.com/your-org/simple-http-server" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /out/httpserver /app/httpserver
-COPY --chown=nonroot:nonroot configs/ /app/configs/
+COPY --from=builder /out/simple-http-server /app/simple-http-server
+COPY config/config.yaml /app/config/config.yaml
 
 USER nonroot:nonroot
 
-EXPOSE 8080 8443 9090
+EXPOSE 8080 8443
 
-ENTRYPOINT ["/app/httpserver"]
-CMD ["--config", "/app/configs/config.yaml"]
+ENTRYPOINT ["/app/simple-http-server"]
+CMD ["--config", "/app/config/config.yaml"]

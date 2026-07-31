@@ -7,7 +7,7 @@ metadata:
     app: simple-http-server
   annotations:
     cloud.google.com/neg: '{"ingress": true}'
-    cloud.google.com/backend-config: '{"default": "http-server-backendconfig"}'
+    cloud.google.com/backend-config: '{"default": "simple-http-server-backendconfig"}'
 spec:
   type: ClusterIP
   selector:
@@ -15,44 +15,39 @@ spec:
   ports:
     - name: http
       port: 80
-      targetPort: 8080
+      targetPort: http
       protocol: TCP
     - name: https
       port: 443
-      targetPort: 8443
+      targetPort: https
       protocol: TCP
 ---
 apiVersion: cloud.google.com/v1
 kind: BackendConfig
 metadata:
-  name: http-server-backendconfig
+  name: simple-http-server-backendconfig
   namespace: simple-http-server
 spec:
-  timeoutSec: 30
-  connectionDraining:
-    drainingTimeoutSec: 60
   healthCheck:
-    checkIntervalSec: 15
+    checkIntervalSec: 10
     timeoutSec: 5
     healthyThreshold: 2
     unhealthyThreshold: 3
     type: HTTP
     requestPath: /healthz
     port: 8080
-  securityPolicy:
-    name: "http-server-armor-policy"
-  sessionAffinity:
-    affinityType: "CLIENT_IP"
+  timeoutSec: 30
+  connectionDraining:
+    drainingTimeoutSec: 30
 ---
 apiVersion: networking.gke.io/v1
 kind: ManagedCertificate
 metadata:
-  name: http-server-managed-cert
+  name: simple-http-server-cert
   namespace: simple-http-server
 spec:
   domains:
     - example.com
-    - www.example.com
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -61,15 +56,10 @@ metadata:
   namespace: simple-http-server
   annotations:
     kubernetes.io/ingress.class: "gce"
-    kubernetes.io/ingress.global-static-ip-name: "http-server-static-ip"
-    networking.gke.io/managed-certificates: "http-server-managed-cert"
+    kubernetes.io/ingress.global-static-ip-name: "simple-http-server-ip"
+    networking.gke.io/managed-certificates: "simple-http-server-cert"
     kubernetes.io/ingress.allow-http: "true"
 spec:
-  defaultBackend:
-    service:
-      name: simple-http-server
-      port:
-        number: 80
   rules:
     - host: example.com
       http:

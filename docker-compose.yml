@@ -1,57 +1,54 @@
 version: "3.9"
 
 services:
-  http-server:
+  simple-http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: local
-        COMMIT_SHA: local-dev
-    image: simple-http-server:local
+        VERSION: ${VERSION:-dev}
+    image: simple-http-server:${VERSION:-dev}
     container_name: simple-http-server
     restart: unless-stopped
     ports:
-      - "8080:8080"   # HTTP
-      - "8443:8443"   # HTTPS
-      - "9090:9090"   # Metrics
+      - "80:8080"    # HTTP / proxy entrypoint
+      - "443:8443"   # HTTPS (TLS termination)
     environment:
-      APP_ENV: development
-      LOG_LEVEL: debug
-      TLS_CERT_FILE: /app/certs/server.crt
-      TLS_KEY_FILE: /app/certs/server.key
-      UPSTREAM_BACKENDS: "backend-a:9001,backend-b:9002"
-      LB_STRATEGY: round_robin
+      - SERVER_LOG_LEVEL=info
+      - SERVER_TLS_CERT=/etc/certs/tls.crt
+      - SERVER_TLS_KEY=/etc/certs/tls.key
+      - SERVER_UPSTREAMS=backend-a:5678,backend-b:5678
     volumes:
-      - ./configs:/app/configs:ro
-      - ./certs:/app/certs:ro
+      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./certs:/etc/certs:ro
     depends_on:
-      backend-a:
-        condition: service_started
-      backend-b:
-        condition: service_started
+      - backend-a
+      - backend-b
     networks:
       - edge
     healthcheck:
-      test: ["CMD", "/app/httpserver", "--healthcheck"]
+      test: ["CMD", "/app/simple-http-server", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
 
-  # Demo upstream target #1 for reverse-proxy / load-balancing
   backend-a:
     image: hashicorp/http-echo:1.0
     container_name: backend-a
-    command: ["-text=response from backend-a", "-listen=:9001"]
+    command: ["-text=hello from backend-a", "-listen=:5678"]
     networks:
       - edge
 
-  # Demo upstream target #2 for reverse-proxy / load-balancing
   backend-b:
     image: hashicorp/http-echo:1.0
     container_name: backend-b
-    command: ["-text=response from backend-b", "-listen=:9002"]
+    command: ["-text=hello from backend-b", "-listen=:5678"]
     networks:
       - edge
 
