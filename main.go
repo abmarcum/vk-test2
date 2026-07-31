@@ -1,3 +1,7 @@
-// loading invocation, TLS listener construction, HTTP server bootstrap,
-// signal handling (SIGTERM/SIGHUP), graceful shutdown/drain, and
-// top-level wiring of Router <-> Pool <-
+// Package main implements the GoProxy entry point: process lifecycle,
+// config loading, logger construction, TLS listener setup, HTTP/HTTPS
+// server bootstrap, mux route wiring (healthz/metrics/proxy/redirect),
+// signal handling (SIGTERM/SIGHUP), and graceful shutdown orchestration.
+//
+// This file requires Go 1.22+ at build time because it uses the
+// standard-library "log/slog" structured logging package. The module's
