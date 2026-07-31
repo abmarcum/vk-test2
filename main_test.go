@@ -22,12 +22,12 @@ func TestJoinPath(t *testing.T) {
 		{name: "empty extra returns base", base: "/api", extra: "", want: "/api"},
 	}
 
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
-			got := joinPath(c.base, c.extra)
-			if got != c.want {
-				t.Errorf("joinPath(%q, %q) = %q, want %q", c.base, c.extra, got, c.want)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := joinPath(tc.base, tc.extra)
+			if got != tc.want {
+				t.Errorf("joinPath(%q, %q) = %q, want %q", tc.base, tc.extra, got, tc.want)
 			}
 		})
 	}
@@ -42,5 +42,19 @@ func TestNewStrategyDefault(t *testing.T) {
 	}
 	if _, ok := s.(*RoundRobinStrategy); !ok {
 		t.Errorf("newStrategy(%q) = %T, want *RoundRobinStrategy", "unknown-strategy", s)
+	}
+}
+
+// TestNewStrategyKnownKinds verifies each recognized strategy name resolves
+// to its corresponding concrete Strategy implementation.
+func TestNewStrategyKnownKinds(t *testing.T) {
+	if _, ok := newStrategy("round_robin").(*RoundRobinStrategy); !ok {
+		t.Errorf("newStrategy(%q) did not return *RoundRobinStrategy", "round_robin")
+	}
+	if _, ok := newStrategy("least_connections").(*LeastConnStrategy); !ok {
+		t.Errorf("newStrategy(%q) did not return *LeastConnStrategy", "least_connections")
+	}
+	if _, ok := newStrategy("random").(*RandomStrategy); !ok {
+		t.Errorf("newStrategy(%q) did not return *RandomStrategy", "random")
 	}
 }
