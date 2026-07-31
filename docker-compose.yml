@@ -1,0 +1,64 @@
+version: "3.9"
+
+services:
+  http-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: "0.1.0"
+        COMMIT_SHA: "local-dev"
+    image: simple-http-server:local
+    container_name: simple-http-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    environment:
+      PORT: "8080"
+      TLS_PORT: "8443"
+      TLS_CERT_FILE: "/certs/server.crt"
+      TLS_KEY_FILE: "/certs/server.key"
+      UPSTREAMS: "backend-a:9001,backend-b:9002"
+      LB_STRATEGY: "round_robin"
+      CONFIG_PATH: "/app/config/config.yaml"
+    volumes:
+      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./certs:/certs:ro
+    depends_on:
+      - backend-a
+      - backend-b
+    networks:
+      - edge
+    healthcheck:
+      test: ["CMD", "/app/server", "--healthcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 128M
+
+  backend-a:
+    image: hashicorp/http-echo:latest
+    container_name: backend-a
+    command: ["-text=response from backend-a", "-listen=:9001"]
+    networks:
+      - edge
+
+  backend-b:
+    image: hashicorp/http-echo:latest
+    container_name: backend-b
+    command: ["-text=response from backend-b", "-listen=:9002"]
+    networks:
+      - edge
+
+networks:
+  edge:
+    driver: bridge
+```
+
+---

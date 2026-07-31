@@ -1,0 +1,177 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-http-server
+  namespace: default
+  labels:
+    app: simple-http-server
+    app.kubernetes.io/name: simple-http-server
+    app.kubernetes.io/part-of: simple-http-server
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: simple-http-server
+  template:
+    metadata:
+      labels:
+        app: simple-http-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: simple-http-server-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: simple-http-server
+          image: us-docker.pkg.dev/PROJECT_ID/simple-http-server-repo/simple-http-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: TLS_PORT
+              value: "8443"
+            - name: TLS_CERT_FILE
+              value: "/etc/tls/tls.crt"
+            - name: TLS_KEY_FILE
+              value: "/etc/tls/tls.key"
+            - name: LB_STRATEGY
+              value: "round_robin"
+            - name: CONFIG_PATH
+              value: "/app/config/config.yaml"
+          envFrom:
+            - configMapRef:
+                name: simple-http-server-config
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 12
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/tls
+              readOnly: true
+            - name: app-config
+              mountPath: /app/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: simple-http-server-tls
+            optional: true
+        - name: app-config
+          configMap:
+            name: simple-http-server-config
+        - name: tmp
+          emptyDir: {}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: simple-http-server
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simple-http-server-config
+  namespace: default
+data:
+  config.yaml: |
+    server:
+      lb_strategy: round_robin
+      upstreams:
+        - name: backend-a
+          address: backend-a.default.svc.cluster.local:9001
+        - name: backend-b
+          address: backend-b.default.svc.cluster.local:9002
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: simple-http-server-sa
+  namespace: default
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: simple-http-server-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: simple-http-server
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: simple-http-server-pdb
+  namespace: default
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: simple-http-server
+```
+
+---
