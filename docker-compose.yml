@@ -1,54 +1,59 @@
 version: "3.9"
 
+x-common-env: &common-env
+  LOG_LEVEL: "info"
+  LB_STRATEGY: "round_robin"          # round_robin | least_conn | ip_hash
+  TLS_CERT_FILE: "/certs/server.crt"
+  TLS_KEY_FILE: "/certs/server.key"
+  UPSTREAMS: "http://backend-1:80,http://backend-2:80"
+
 services:
-  simple-http-server:
+  http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: ${VERSION:-dev}
-        COMMIT_SHA: ${COMMIT_SHA:-local}
-        BUILD_DATE: ${BUILD_DATE:-unknown}
+        VERSION: "local-dev"
     image: simple-http-server:local
     container_name: simple-http-server
     restart: unless-stopped
     ports:
-      - "8080:8080"   # HTTP
-      - "8443:8443"   # HTTPS
+      - "8080:8080"   # HTTP / proxy / LB entrypoint
+      - "8443:8443"   # HTTPS (SSL termination)
     environment:
-      - APP_ENV=development
-      - LOG_LEVEL=debug
-      - TLS_CERT_PATH=/certs/tls.crt
-      - TLS_KEY_PATH=/certs/tls.key
-      - UPSTREAM_1=http://backend-1:9000
-      - UPSTREAM_2=http://backend-2:9000
-      - LB_STRATEGY=round_robin
+      <<: *common-env
     volumes:
-      - ./configs:/app/configs:ro
       - ./certs:/certs:ro
+      - ./config:/app/config:ro
+    depends_on:
+      - backend-1
+      - backend-2
+    networks:
+      - edge-net
     healthcheck:
-      test: ["CMD", "/app/simple-http-server", "--healthcheck"]
+      test: ["CMD", "/app/server", "-healthcheck"]
       interval: 15s
       timeout: 3s
       retries: 3
       start_period: 5s
-    networks:
-      - edge-net
-    depends_on:
-      - backend-1
-      - backend-2
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
 
+  # --- Sample upstream backends to exercise proxy / load-balancing locally ---
   backend-1:
-    image: hashicorp/http-echo:1.0
+    image: traefik/whoami:latest
     container_name: backend-1
-    command: ["-text=response-from-backend-1", "-listen=:9000"]
+    restart: unless-stopped
     networks:
       - edge-net
 
   backend-2:
-    image: hashicorp/http-echo:1.0
+    image: traefik/whoami:latest
     container_name: backend-2
-    command: ["-text=response-from-backend-2", "-listen=:9000"]
+    restart: unless-stopped
     networks:
       - edge-net
 

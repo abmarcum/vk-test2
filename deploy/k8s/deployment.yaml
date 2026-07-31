@@ -1,12 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: http-server-config
+  namespace: default
+  labels:
+    app: http-server
+data:
+  server.yaml: |
+    listen:
+      http: ":8080"
+      https: ":8443"
+    tls:
+      certFile: /etc/tls/tls.crt
+      keyFile: /etc/tls/tls.key
+    loadBalancer:
+      strategy: round_robin
+      upstreams:
+        - http://backend-1.default.svc.cluster.local
+        - http://backend-2.default.svc.cluster.local
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: simple-http-server
+  name: http-server
   namespace: default
   labels:
-    app: simple-http-server
-    app.kubernetes.io/name: simple-http-server
-    app.kubernetes.io/part-of: simple-http-server-platform
+    app: http-server
+    tier: edge
 spec:
   replicas: 3
   revisionHistoryLimit: 5
@@ -17,46 +37,55 @@ spec:
       maxUnavailable: 0
   selector:
     matchLabels:
-      app: simple-http-server
+      app: http-server
   template:
     metadata:
       labels:
-        app: simple-http-server
+        app: http-server
+        tier: edge
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: simple-http-server
+      serviceAccountName: http-server-sa
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         fsGroup: 65532
-        seccompProfile:
-          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["http-server"]
+                topologyKey: "kubernetes.io/hostname"
       containers:
-        - name: simple-http-server
-          image: gcr.io/PROJECT_ID/simple-http-server:latest
-          imagePullPolicy: IfNotPresent
+        - name: http-server
+          image: us-docker.pkg.dev/PROJECT_ID/simple-http-server/simple-http-server:latest
+          imagePullPolicy: Always
+          args: ["-config", "/app/config/server.yaml"]
           ports:
             - name: http
               containerPort: 8080
+              protocol: TCP
             - name: https
               containerPort: 8443
+              protocol: TCP
           env:
-            - name: APP_ENV
-              value: "production"
             - name: LOG_LEVEL
               value: "info"
-            - name: TLS_CERT_PATH
-              value: "/etc/tls/tls.crt"
-            - name: TLS_KEY_PATH
-              value: "/etc/tls/tls.key"
             - name: LB_STRATEGY
               value: "round_robin"
           envFrom:
-            - configMapRef:
-                name: simple-http-server-config
+            - secretRef:
+                name: http-server-secrets
+                optional: true
           resources:
             requests:
               cpu: "100m"
@@ -64,89 +93,73 @@ spec:
             limits:
               cpu: "500m"
               memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: http
-            initialDelaySeconds: 3
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 3
-          startupProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            failureThreshold: 30
-            periodSeconds: 2
           volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
             - name: tls-certs
               mountPath: /etc/tls
               readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: config
+          configMap:
+            name: http-server-config
         - name: tls-certs
           secret:
-            secretName: simple-http-server-tls
+            secretName: http-server-tls
         - name: tmp
           emptyDir: {}
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: simple-http-server
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: simple-http-server
+  name: http-server-sa
   namespace: default
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: simple-http-server-config
-  namespace: default
-data:
-  UPSTREAM_1: "http://backend-1.internal.svc.cluster.local:9000"
-  UPSTREAM_2: "http://backend-2.internal.svc.cluster.local:9000"
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: simple-http-server-pdb
+  name: http-server-pdb
   namespace: default
 spec:
   minAvailable: 2
   selector:
     matchLabels:
-      app: simple-http-server
+      app: http-server
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: simple-http-server-hpa
+  name: http-server-hpa
   namespace: default
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: simple-http-server
+    name: http-server
   minReplicas: 3
   maxReplicas: 10
   metrics:
@@ -155,10 +168,10 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 65
+          averageUtilization: 70
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 75
+          averageUtilization: 80
