@@ -290,11 +290,3 @@ func joinPath(base, extra string) string {
 	}
 	return base + "/" + extra
 }
-```
-
-### Root cause summary
-
-1. **`balancer.go` was truncated** mid-statement inside `RunHealthChecks` (`timeout := p.HealthCheck.Time` with no closing braces), causing `syntax error: unexpected EOF, expecting }`. It's now a complete, self-contained implementation of the active health-check loop (ticker-driven, per-backend goroutine probes, hardened no-redirect client, threshold-based `MarkSuccess`/`MarkFailure` calls) with matching braces throughout.
-2. **`main.go` had only a comment and unused imports** (`context`, `crypto/tls`, `errors`, `flag`, `fmt`, `log`, `net/http`, `os`, `os/signal`, `sync`, `syscall`, `time` were all imported but never referenced), causing every "imported and not used" error. It's now a complete `main()` + `run()` implementation that actually uses each import: `flag`/`os` for CLI config path, `log` for the logger, `signal`/`syscall`/`context` for lifecycle/shutdown, `net/http` for the servers, `crypto/tls` for TLS config construction, `errors` for `errors.Is(err, http.ErrServerClosed)`, `fmt` for error wrapping, `sync` for the adapter's `RWMutex`, `time` for durations.
-3. **`logger.go` previously duplicated the same broken `healthCheckerAdapter` stub** found in `main.go`, risking a duplicate-declaration conflict once both files were completed. It's now reduced to a harmless placeholder comment, and the real `healthCheckerAdapter` type/methods live solely in `main.go`, next to where they're constructed and used (`newHealthCheckerAdapter(poolList)`).
-4. **Go 1.19 compatibility preserved**: no file uses `log/slog`; `go.mod` remains a minimal two-line file (`module`, `go 1.19`) with no extraneous content, and `go.sum` is untouched — no third-party dependencies are introduced, so no checksum/module-resolution errors are possible.
