@@ -1,0 +1,33 @@
+// resolution failures entirely. Config files may be authored as JSON;
+// operators who prefer YAML can convert with any standard tool prior to
+// deployment.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+)
+
+// parseConfig decodes raw JSON bytes into a Config. Unknown fields are
+// rejected to catch typos, mirroring the strict-schema behavior described
+// in the project documentation.
+func parseConfig(raw []byte) (*Config, error) {
+	dec := json.NewDecoder(newBytesReader(raw))
+	dec.DisallowUnknownFields()
+
+	var cfg Config
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode json: %w", err)
+	}
+	return &cfg, nil
+}
+
+// parseURLStrict parses a URL, returning an error for malformed input.
+func parseURLStrict(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("malformed url: %w", err)
+	}
+	return u, nil
+}

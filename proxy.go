@@ -1,8 +1,10 @@
-// against a set of live pools.
 type healthCheckerAdapter struct {
-	pools []*Pool
+	pools map[string]*Pool
 }
 
+// AnyPoolHealthy reports true if at least one backend across any pool is
+// currently alive, or if there are no pools/backends configured at all
+// (fail-open for liveness purposes when health checking is not wired up).
 func (h *healthCheckerAdapter) AnyPoolHealthy() bool {
 	if len(h.pools) == 0 {
 		return true
@@ -18,189 +20,121 @@ func (h *healthCheckerAdapter) AnyPoolHealthy() bool {
 }
 
 func main() {
-	configPath := flag.String("config", envOrDefault("CONFIG_PATH", "/app/config/config.yaml"), "path to config YAML file")
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// run performs the full bootstrap sequence and blocks until shutdown
+// completes. Returns a non-nil error only for startup-time failures.
+func run() error {
+	configPath := flag.String("config", envOr("CONFIG_PATH", "/app/config/config.yaml"), "path to config file")
+	logLevel := flag.String("log-level", envOr("LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	flag.Parse()
 
-	logLevel := envOrDefault("LOG_LEVEL", "info")
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: parseLogLevel(logLevel),
-	}))
+	logger := newLogger(*logLevel)
 
-	cfg, err := LoadConfig(*configPath)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	defer stop()
+
+	cfg, err := LoadConfig(ctx, *configPath)
 	if err != nil {
-		logger.Error("failed to load config", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
 	}
 
 	pools := make(map[string]*Pool, len(cfg.Pools))
-	var allPools []*Pool
 	for _, pc := range cfg.Pools {
 		pool, err := NewPool(pc)
 		if err != nil {
-			logger.Error("failed to build pool", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("construct pool %q: %w", pc.Name, err)
 		}
-		pools[pool.Name] = pool
-		allPools = append(allPools, pool)
+		pools[pc.Name] = pool
 	}
 
 	router, err := NewRouter(cfg.Routes, pools)
 	if err != nil {
-		logger.Error("failed to build router", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("construct router: %w", err)
 	}
 
 	metrics := NewMetrics()
 	proxyServer := NewProxyServer(router, metrics, logger)
-	hc := &healthCheckerAdapter{pools: allPools}
+	hc := &healthCheckerAdapter{pools: pools}
 
 	healthCtx, cancelHealth := context.WithCancel(context.Background())
-	for _, p := range allPools {
-		go p.RunHealthChecks(healthCtx, logger)
+	defer cancelHealth()
+	for _, pool := range pools {
+		if pool.HealthCheckEnabled() {
+			go pool.RunHealthChecks(healthCtx, logger)
+		}
 	}
 
 	mux := NewMux(proxyServer, metrics, hc, logger)
 
-	var servers []*http.Server
-
-	timeouts := cfg.Server.Timeouts
-	readHeaderTimeout := mustParseDuration(timeouts.ReadHeader, 5*time.Second)
-	readTimeout := mustParseDuration(timeouts.Read, 15*time.Second)
-	writeTimeout := mustParseDuration(timeouts.Write, 15*time.Second)
-	idleTimeout := mustParseDuration(timeouts.Idle, 60*time.Second)
-
-	httpServer := &http.Server{
+	srv := &http.Server{
 		Addr:              cfg.Server.HTTPAddr,
 		Handler:           mux,
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
-		IdleTimeout:       idleTimeout,
+		ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
+		ReadTimeout:       cfg.Server.Timeouts.ReadDur,
+		WriteTimeout:      cfg.Server.Timeouts.WriteDur,
+		IdleTimeout:       cfg.Server.Timeouts.IdleDur,
 	}
-	servers = append(servers, httpServer)
+
+	servers := []*http.Server{srv}
 
 	go func() {
-		logger.Info("starting HTTP listener", "addr", cfg.Server.HTTPAddr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("http server error", "error", err)
+		logger.Info("http listener starting", "addr", cfg.Server.HTTPAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("http listener failed", "error", err.Error())
 		}
 	}()
 
-	var httpsServer *http.Server
 	if cfg.Server.EnableTLS {
 		tlsCfg, err := buildTLSListenerConfig(cfg.Server.TLS.CertPEM, cfg.Server.TLS.KeyPEM, cfg.Server.TLS.MinVersion)
 		if err != nil {
-			logger.Error("failed to build TLS config", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("build tls config: %w", err)
 		}
 
-		httpsServer = &http.Server{
+		httpsMux := NewMux(proxyServer, metrics, hc, logger)
+
+		httpsSrv := &http.Server{
 			Addr:              cfg.Server.HTTPSAddr,
-			Handler:           mux,
+			Handler:           httpsMux,
 			TLSConfig:         tlsCfg,
-			ReadHeaderTimeout: readHeaderTimeout,
-			ReadTimeout:       readTimeout,
-			WriteTimeout:      writeTimeout,
-			IdleTimeout:       idleTimeout,
+			ReadHeaderTimeout: cfg.Server.Timeouts.ReadHeaderDur,
+			ReadTimeout:       cfg.Server.Timeouts.ReadDur,
+			WriteTimeout:      cfg.Server.Timeouts.WriteDur,
+			IdleTimeout:       cfg.Server.Timeouts.IdleDur,
 		}
-		servers = append(servers, httpsServer)
+		servers = append(servers, httpsSrv)
 
 		go func() {
-			logger.Info("starting HTTPS listener", "addr", cfg.Server.HTTPSAddr)
-			if err := httpsServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("https server error", "error", err)
+			logger.Info("https listener starting", "addr", cfg.Server.HTTPSAddr)
+			if err := httpsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("https listener failed", "error", err.Error())
 			}
 		}()
 	} else {
 		logger.Warn("TLS not configured — HTTP-only mode (dev/test)")
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	<-ctx.Done()
+	logger.Info("shutdown signal received")
+	cancelHealth()
 
 	grace := time.Duration(cfg.Server.ShutdownGraceSeconds) * time.Second
+	gracefulShutdown(servers, grace, logger)
 
-	for sig := range sigCh {
-		switch sig {
-		case syscall.SIGHUP:
-			logger.Warn("config reload not supported in v1; restart process to apply changes")
-		case syscall.SIGTERM, syscall.SIGINT:
-			logger.Info("shutdown signal received, draining", "signal", sig.String())
-			cancelHealth()
-			gracefulShutdown(context.Background(), servers, grace, logger)
-			return
-		}
-	}
+	return nil
 }
 
-func gracefulShutdown(ctx context.Context, servers []*http.Server, grace time.Duration, logger *slog.Logger) {
-	shutdownCtx, cancel := context.WithTimeout(ctx, grace)
-	defer cancel()
-
-	for _, s := range servers {
-		if s == nil {
-			continue
-		}
-		if err := s.Shutdown(shutdownCtx); err != nil {
-			logger.Error("error during graceful shutdown", "error", err)
-		}
-	}
-}
-
-func buildTLSListenerConfig(certPEM, keyPEM []byte, minVersion string) (*tls.Config, error) {
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
-	}
-
-	minVer := uint16(tls.VersionTLS12)
-	if minVersion == "1.3" {
-		minVer = tls.VersionTLS13
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   minVer,
-	}, nil
-}
-
-func envOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func parseLogLevel(level string) slog.Level {
+// newLogger constructs a JSON slog.Logger at the requested level.
+func newLogger(level string) *slog.Logger {
+	var lvl slog.Level
 	switch level {
 	case "debug":
-		return slog.LevelDebug
+		lvl = slog.LevelDebug
 	case "warn":
-		return slog.LevelWarn
+		lvl = slog.LevelWarn
 	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
-}
-
-func mustParseDuration(s string, def time.Duration) time.Duration {
-	if s == "" {
-		return def
-	}
-	d, err := parseDurationSafe(s)
-	if err != nil {
-		return def
-	}
-	return d
-}
-
-func parseDurationSafe(s string) (time.Duration, error) {
-	return time.ParseDuration(s)
-}
-```
-
-**Summary of the fix:**
-
-1. **`go.mod`**: Removed the `toolchain go1.22.2` directive entirely (unsupported by the older `go` binary present in the sandbox, causing the `unknown directive: toolchain` parse error) and rewrote the file cleanly to eliminate the stray corrupted content from prior attempts (`unexpected newline in string`). Kept `go 1.22` so `log/slog` and other modern stdlib features remain available on a properly provisioned toolchain.
-2. **`main.go`, `config.go`, `balancer.go`**: These files were previously just dangling comment fragments (invalid Go — not even a `package` clause), which is why earlier attempts failed with `expected 'package', found 'EOF'`/`found 'func'`. Replaced them with complete, valid `package main` implementations consistent with `proxy.go`'s existing types (`RouteConf`, `PoolConf`, `HealthCheckConf`, `BackendConf`, `Pool`, `Backend`, `ErrNoHealthyBackends`, `NewMux`, `NewProxyServer`, `NewMetrics`, `healthChecker`), so the whole module now compiles as one cohesive `package main`.
+		lv
