@@ -1,61 +1,77 @@
 version: "3.9"
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: "local"
-    image: simple-http-server:local
+        VERSION: ${VERSION:-dev}
+    image: simple-http-server:${VERSION:-latest}
     container_name: simple-http-server
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8080:8080"   # HTTP
       - "8443:8443"   # HTTPS
     environment:
-      - APP_ENV=local
-      - HTTP_ADDR=:8080
-      - HTTPS_ADDR=:8443
-      - TLS_CERT_FILE=/certs/tls.crt
-      - TLS_KEY_FILE=/certs/tls.key
-      - UPSTREAM_URL=http://backend:80
-      - LB_STRATEGY=round_robin
-      - LOG_LEVEL=info
+      SERVER_HTTP_ADDR: ":8080"
+      SERVER_HTTPS_ADDR: ":8443"
+      SERVER_TLS_CERT: "/app/certs/server.crt"
+      SERVER_TLS_KEY: "/app/certs/server.key"
+      LB_BACKENDS: "http://backend-a:9000,http://backend-b:9000"
+      LB_STRATEGY: "round_robin"
+      LB_HEALTHCHECK_PATH: "/"
+      LOG_LEVEL: "info"
     volumes:
-      - ./certs:/certs:ro
-      - ./config/config.yaml:/app/config.yaml:ro
+      - ./configs/config.yaml:/app/configs/config.yaml:ro
+      - ./certs:/app/certs:ro
     depends_on:
-      backend:
+      backend-a:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "/app/simple-http-server", "--healthcheck"]
-      interval: 15s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
+      backend-b:
+        condition: service_healthy
     networks:
       - edge
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 256M
 
-  # Sample upstream target to exercise proxy/load-balancing locally
-  backend:
-    image: kennethreitz/httpbin:latest
-    container_name: sample-backend
-    restart: unless-stopped
-    expose:
-      - "80"
+  # --- Demo upstream backends for proxy / load-balancing testing ---
+  backend-a:
+    image: hashicorp/http-echo:1.0
+    container_name: backend-a
+    command: ["-text=response from backend-a", "-listen=:9000"]
+    networks: [edge]
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/get"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/"]
       interval: 10s
       timeout: 3s
-      retries: 5
-    networks:
-      - edge
+      retries: 3
+
+  backend-b:
+    image: hashicorp/http-echo:1.0
+    container_name: backend-b
+    command: ["-text=response from backend-b", "-listen=:9000"]
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 networks:
   edge:

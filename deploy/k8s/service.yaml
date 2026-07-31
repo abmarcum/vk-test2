@@ -1,3 +1,35 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: simple-http-server
+  namespace: simple-http-server
+  annotations:
+    iam.gke.io/gcp-service-account: simple-http-server@PROJECT_ID.iam.gserviceaccount.com
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: simple-http-server
+  namespace: simple-http-server
+  labels:
+    app: simple-http-server
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "simple-http-server-backendconfig"}'
+spec:
+  type: ClusterIP
+  selector:
+    app: simple-http-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP
+---
 apiVersion: cloud.google.com/v1
 kind: BackendConfig
 metadata:
@@ -18,79 +50,54 @@ spec:
   sessionAffinity:
     affinityType: "CLIENT_IP"
 ---
-apiVersion: v1
-kind: Service
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
 metadata:
-  name: simple-http-server
+  name: simple-http-server-cert
   namespace: simple-http-server
-  labels:
-    app.kubernetes.io/name: simple-http-server
-  annotations:
-    cloud.google.com/backend-config: '{"default": "simple-http-server-backendconfig"}'
-    cloud.google.com/neg: '{"ingress": true}'
-    networking.gke.io/load-balancer-type: "External"
 spec:
-  type: LoadBalancer
-  loadBalancerIP: "" # set to reserved static IP (google_compute_global_address) if using L4 LB directly
-  selector:
-    app.kubernetes.io/name: simple-http-server
-  ports:
-    - name: http
-      port: 80
-      targetPort: http
-      protocol: TCP
-    - name: https
-      port: 443
-      targetPort: https
-      protocol: TCP
-  sessionAffinity: None
+  domains:
+    - example.com
 ---
-apiVersion: v1
-kind: Service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
 metadata:
-  name: simple-http-server-internal
+  name: simple-http-server-ingress
   namespace: simple-http-server
-  labels:
-    app.kubernetes.io/name: simple-http-server
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: "simple-http-server-ip"
+    networking.gke.io/managed-certificates: "simple-http-server-cert"
+    kubernetes.io/ingress.allow-http: "true"
 spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: simple-http-server
-  ports:
-    - name: http
-      port: 8080
-      targetPort: http
-    - name: https
-      port: 8443
-      targetPort: https
+  defaultBackend:
+    service:
+      name: simple-http-server
+      port:
+        number: 80
 ```
 
 ## deploy/terraform/main.tf
-
 ```hcl
-###############################################################################
-# Simple HTTP Server - GCP Infrastructure
-# GKE + Artifact Registry + Global HTTPS Load Balancing + Managed SSL
-###############################################################################
-
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.6.0"
 
   required_providers {
-    google      = { source = "hashicorp/google",      version = "~> 5.10" }
-    google-beta = { source = "hashicorp/google-beta", version = "~> 5.10" }
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.30"
+    }
   }
 
   backend "gcs" {
-    bucket = "REPLACE_WITH_YOUR_TF_STATE_BUCKET"
+    bucket = "TF_STATE_BUCKET" # override via -backend-config
     prefix = "simple-http-server/state"
   }
 }
 
-###############################################################################
+############################
 # Variables
-###############################################################################
-
+############################
 variable "project_id" {
   description = "GCP project ID"
   type        = string
@@ -109,131 +116,135 @@ variable "zone" {
 }
 
 variable "environment" {
-  description = "Deployment environment"
+  description = "Deployment environment (dev/staging/prod)"
   type        = string
   default     = "prod"
 }
 
-variable "app_name" {
-  description = "Application name"
+variable "cluster_name" {
+  description = "GKE cluster name"
   type        = string
-  default     = "simple-http-server"
+  default     = "simple-http-server-cluster"
 }
 
-variable "domain_name" {
-  description = "Public domain name served by the load balancer (managed SSL cert)"
-  type        = string
-  default     = "example.com"
-}
-
-variable "gke_node_count" {
-  description = "Number of nodes per zone in the GKE node pool"
-  type        = number
-  default     = 2
-}
-
-variable "gke_machine_type" {
+variable "node_machine_type" {
   description = "GKE node machine type"
   type        = string
   default     = "e2-standard-2"
 }
 
-###############################################################################
-# Providers
-###############################################################################
+variable "node_count" {
+  description = "Initial node count per zone"
+  type        = number
+  default     = 2
+}
 
+variable "min_node_count" {
+  type    = number
+  default = 1
+}
+
+variable "max_node_count" {
+  type    = number
+  default = 5
+}
+
+############################
+# Providers
+############################
 provider "google" {
   project = var.project_id
   region  = var.region
 }
 
-provider "google-beta" {
-  project = var.project_id
-  region  = var.region
-}
-
-###############################################################################
-# APIs
-###############################################################################
-
+############################
+# Enable required APIs
+############################
 resource "google_project_service" "apis" {
   for_each = toset([
-    "compute.googleapis.com",
     "container.googleapis.com",
+    "compute.googleapis.com",
     "artifactregistry.googleapis.com",
-    "dns.googleapis.com",
     "iam.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "certificatemanager.googleapis.com",
   ])
   project            = var.project_id
   service            = each.value
   disable_on_destroy = false
 }
 
-###############################################################################
+############################
 # Networking
-###############################################################################
-
+############################
 resource "google_compute_network" "vpc" {
-  name                    = "${var.app_name}-vpc"
+  name                    = "simple-http-server-vpc"
   auto_create_subnetworks = false
   depends_on              = [google_project_service.apis]
 }
 
 resource "google_compute_subnetwork" "subnet" {
-  name          = "${var.app_name}-subnet"
-  ip_cidr_range = "10.10.0.0/20"
-  region        = var.region
-  network       = google_compute_network.vpc.id
+  name                     = "simple-http-server-subnet"
+  ip_cidr_range            = "10.10.0.0/20"
+  region                   = var.region
+  network                  = google_compute_network.vpc.id
+  private_ip_google_access = true
 
   secondary_ip_range {
-    range_name    = "gke-pods"
+    range_name    = "pods"
     ip_cidr_range = "10.20.0.0/16"
   }
+
   secondary_ip_range {
-    range_name    = "gke-services"
+    range_name    = "services"
     ip_cidr_range = "10.30.0.0/20"
   }
 }
 
-resource "google_compute_firewall" "allow_health_checks" {
-  name    = "${var.app_name}-allow-lb-health-checks"
+resource "google_compute_router" "router" {
+  name    = "simple-http-server-router"
+  region  = var.region
   network = google_compute_network.vpc.id
+}
+
+resource "google_compute_router_nat" "nat" {
+  name                               = "simple-http-server-nat"
+  router                             = google_compute_router.router.name
+  region                             = var.region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
+
+resource "google_compute_firewall" "allow_health_checks" {
+  name          = "allow-gcp-health-checks"
+  network       = google_compute_network.vpc.id
+  direction     = "INGRESS"
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
 
   allow {
     protocol = "tcp"
     ports    = ["8080", "8443"]
   }
-
-  # Google Cloud LB health check ranges
-  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
-  target_tags   = ["${var.app_name}-node"]
 }
 
-###############################################################################
-# Artifact Registry
-###############################################################################
+resource "google_compute_firewall" "allow_internal" {
+  name          = "allow-internal-traffic"
+  network       = google_compute_network.vpc.id
+  direction     = "INGRESS"
+  source_ranges = ["10.10.0.0/20", "10.20.0.0/16", "10.30.0.0/20"]
 
-resource "google_artifact_registry_repository" "repo" {
-  location      = var.region
-  repository_id = "${var.app_name}-repo"
-  description   = "Container images for ${var.app_name}"
-  format        = "DOCKER"
-  depends_on    = [google_project_service.apis]
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
 }
 
-###############################################################################
-# GKE Cluster (regional, private nodes, workload identity)
-###############################################################################
-
+############################
+# Service Accounts
+############################
 resource "google_service_account" "gke_nodes" {
-  account_id   = "${var.app_name}-gke-node"
-  display_name = "GKE node SA for ${var.app_name}"
-}
-
-resource "google_service_account" "workload" {
-  account_id   = var.app_name
-  display_name = "Workload identity SA for ${var.app_name}"
+  account_id   = "simple-http-server-nodes"
+  display_name = "GKE Node Service Account - simple-http-server"
 }
 
 resource "google_project_iam_member" "gke_node_roles" {
@@ -248,8 +259,22 @@ resource "google_project_iam_member" "gke_node_roles" {
   member  = "serviceAccount:${google_service_account.gke_nodes.email}"
 }
 
+resource "google_service_account" "workload_identity" {
+  account_id   = "simple-http-server"
+  display_name = "Workload Identity SA for simple-http-server app"
+}
+
+resource "google_service_account_iam_member" "wi_binding" {
+  service_account_id = google_service_account.workload_identity.name
+  role                = "roles/iam.workloadIdentityUser"
+  member              = "serviceAccount:${var.project_id}.svc.id.goog[simple-http-server/simple-http-server]"
+}
+
+############################
+# GKE Cluster
+############################
 resource "google_container_cluster" "primary" {
-  name     = "${var.app_name}-cluster"
+  name     = var.cluster_name
   location = var.region
 
   remove_default_node_pool = true
@@ -259,8 +284,8 @@ resource "google_container_cluster" "primary" {
   subnetwork = google_compute_subnetwork.subnet.id
 
   ip_allocation_policy {
-    cluster_secondary_range_name  = "gke-pods"
-    services_secondary_range_name = "gke-services"
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
   }
 
   private_cluster_config {
@@ -269,33 +294,45 @@ resource "google_container_cluster" "primary" {
     master_ipv4_cidr_block  = "172.16.0.0/28"
   }
 
-  workload_identity_config {
-    workload_pool = "${var.project_id}.svc.id.goog"
-  }
-
   release_channel {
     channel = "REGULAR"
   }
 
-  master_authorized_networks_config {
-    cidr_blocks {
-      cidr_block   = "0.0.0.0/0" # restrict to office/VPN CIDR in production
-      display_name = "all"
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  addons_config {
+    horizontal_pod_autoscaling {
+      disabled = false
+    }
+    http_load_balancing {
+      disabled = false
     }
   }
+
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "0.0.0.0/0"
+      display_name = "all (restrict-in-prod)"
+    }
+  }
+
+  deletion_protection = false
 
   depends_on = [google_project_service.apis]
 }
 
-resource "google_container_node_pool" "default" {
-  name       = "${var.app_name}-node-pool"
-  location   = var.region
-  cluster    = google_container_cluster.primary.name
-  node_count = var.gke_node_count
+resource "google_container_node_pool" "primary_nodes" {
+  name     = "${var.cluster_name}-pool"
+  location = var.region
+  cluster  = google_container_cluster.primary.name
+
+  initial_node_count = var.node_count
 
   autoscaling {
-    min_node_count = 2
-    max_node_count = 6
+    min_node_count = var.min_node_count
+    max_node_count = var.max_node_count
   }
 
   management {
@@ -304,21 +341,17 @@ resource "google_container_node_pool" "default" {
   }
 
   node_config {
-    machine_type    = var.gke_machine_type
-    tags            = ["${var.app_name}-node"]
+    machine_type    = var.node_machine_type
     service_account = google_service_account.gke_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
 
-    oauth_scopes = [
-      "https://www.googleapis.com/auth/cloud-platform",
-    ]
+    labels = {
+      environment = var.environment
+      app         = "simple-http-server"
+    }
 
     workload_metadata_config {
       mode = "GKE_METADATA"
-    }
-
-    labels = {
-      app         = var.app_name
-      environment = var.environment
     }
 
     shielded_instance_config {
@@ -328,70 +361,85 @@ resource "google_container_node_pool" "default" {
   }
 }
 
-resource "google_service_account_iam_member" "workload_identity_binding" {
-  service_account_id = google_service_account.workload.name
-  role                = "roles/iam.workloadIdentityUser"
-  member              = "serviceAccount:${var.project_id}.svc.id.goog[simple-http-server/simple-http-server]"
+############################
+# Artifact Registry
+############################
+resource "google_artifact_registry_repository" "repo" {
+  location      = var.region
+  repository_id = "simple-http-server"
+  description   = "Docker images for simple-http-server"
+  format        = "DOCKER"
+  depends_on    = [google_project_service.apis]
 }
 
-###############################################################################
-# Global external HTTPS Load Balancer components
-# (Static IP + Managed SSL cert + DNS record; GKE Ingress/Service consumes these)
-###############################################################################
-
-resource "google_compute_global_address" "lb_ip" {
-  name = "${var.app_name}-lb-ip"
+############################
+# Static IP for Ingress / LB
+############################
+resource "google_compute_global_address" "ingress_ip" {
+  name = "simple-http-server-ip"
 }
 
-resource "google_compute_managed_ssl_certificate" "cert" {
-  name = "${var.app_name}-managed-cert"
+############################
+# Cloud Armor Security Policy
+############################
+resource "google_compute_security_policy" "policy" {
+  name        = "simple-http-server-armor"
+  description = "Basic rate-limiting and default deny policy"
 
-  managed {
-    domains = [var.domain_name]
+  rule {
+    action   = "allow"
+    priority = "2147483647"
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+    description = "Default allow rule"
+  }
+
+  rule {
+    action   = "throttle"
+    priority = "1000"
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+    description = "Rate limit abusive clients"
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+      enforce_on_key = "IP"
+      rate_limit_threshold {
+        count        = 500
+        interval_sec = 60
+      }
+    }
   }
 }
 
-resource "google_dns_managed_zone" "zone" {
-  count       = var.domain_name != "" ? 1 : 0
-  name        = "${replace(var.app_name, "_", "-")}-zone"
-  dns_name    = "${var.domain_name}."
-  description = "DNS zone for ${var.app_name}"
-}
-
-resource "google_dns_record_set" "a_record" {
-  count        = var.domain_name != "" ? 1 : 0
-  name         = "${var.domain_name}."
-  managed_zone = google_dns_managed_zone.zone[0].name
-  type         = "A"
-  ttl          = 300
-  rrdatas      = [google_compute_global_address.lb_ip.address]
-}
-
-###############################################################################
+############################
 # Outputs
-###############################################################################
-
-output "gke_cluster_name" {
+############################
+output "cluster_name" {
   value = google_container_cluster.primary.name
 }
 
-output "gke_cluster_endpoint" {
+output "cluster_endpoint" {
   value     = google_container_cluster.primary.endpoint
   sensitive = true
 }
 
-output "artifact_registry_repo" {
+output "artifact_registry_url" {
   value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.repo.repository_id}"
 }
 
-output "load_balancer_ip" {
-  value = google_compute_global_address.lb_ip.address
+output "ingress_static_ip" {
+  value = google_compute_global_address.ingress_ip.address
 }
 
 output "workload_identity_sa_email" {
-  value = google_service_account.workload.email
-}
-
-output "managed_ssl_certificate" {
-  value = google_compute_managed_ssl_certificate.cert.name
+  value = google_service_account.workload_identity.email
 }
