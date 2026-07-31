@@ -1,35 +1,43 @@
 version: "3.9"
 
 services:
-  simple-http-server:
+  http-server:
     build:
       context: .
       dockerfile: Dockerfile
       args:
         VERSION: ${VERSION:-dev}
-    image: simple-http-server:${VERSION:-dev}
+        COMMIT_SHA: ${COMMIT_SHA:-local}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    image: simple-http-server:${VERSION:-latest}
     container_name: simple-http-server
     restart: unless-stopped
     ports:
-      - "80:8080"    # HTTP / proxy entrypoint
-      - "443:8443"   # HTTPS (TLS termination)
+      - "8080:8080"   # HTTP (redirects to HTTPS / health)
+      - "8443:8443"   # HTTPS termination + reverse proxy + LB
     environment:
-      - SERVER_LOG_LEVEL=info
-      - SERVER_TLS_CERT=/etc/certs/tls.crt
-      - SERVER_TLS_KEY=/etc/certs/tls.key
-      - SERVER_UPSTREAMS=backend-a:5678,backend-b:5678
+      APP_ENV: production
+      LISTEN_HTTP_ADDR: ":8080"
+      LISTEN_HTTPS_ADDR: ":8443"
+      TLS_CERT_FILE: /etc/certs/tls.crt
+      TLS_KEY_FILE: /etc/certs/tls.key
+      UPSTREAM_BACKENDS: "backend-1:9000,backend-2:9000"
+      LB_STRATEGY: round_robin
+      LOG_LEVEL: info
     volumes:
-      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./config:/app/config:ro
       - ./certs:/etc/certs:ro
     depends_on:
-      - backend-a
-      - backend-b
+      backend-1:
+        condition: service_healthy
+      backend-2:
+        condition: service_healthy
     networks:
       - edge
     healthcheck:
       test: ["CMD", "/app/simple-http-server", "--healthcheck"]
       interval: 30s
-      timeout: 5s
+      timeout: 3s
       retries: 3
       start_period: 5s
     deploy:
@@ -37,20 +45,32 @@ services:
         limits:
           cpus: "1.0"
           memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 64M
 
-  backend-a:
+  # ---- Sample upstream backends for local proxy/LB validation ----
+  backend-1:
     image: hashicorp/http-echo:1.0
-    container_name: backend-a
-    command: ["-text=hello from backend-a", "-listen=:5678"]
+    command: ["-text=response from backend-1", "-listen=:9000"]
     networks:
       - edge
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
-  backend-b:
+  backend-2:
     image: hashicorp/http-echo:1.0
-    container_name: backend-b
-    command: ["-text=hello from backend-b", "-listen=:5678"]
+    command: ["-text=response from backend-2", "-listen=:9000"]
     networks:
       - edge
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 networks:
   edge:

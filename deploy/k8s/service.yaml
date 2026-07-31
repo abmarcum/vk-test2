@@ -1,17 +1,45 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: simple-http-server
+  name: simple-http-server-internal
   namespace: simple-http-server
   labels:
-    app: simple-http-server
-  annotations:
-    cloud.google.com/neg: '{"ingress": true}'
-    cloud.google.com/backend-config: '{"default": "simple-http-server-backendconfig"}'
+    app.kubernetes.io/name: simple-http-server
 spec:
   type: ClusterIP
   selector:
-    app: simple-http-server
+    app.kubernetes.io/name: simple-http-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP
+---
+# GCP-native external LoadBalancer (creates a Google Cloud Network/HTTP(S) LB)
+apiVersion: v1
+kind: Service
+metadata:
+  name: simple-http-server-external
+  namespace: simple-http-server
+  labels:
+    app.kubernetes.io/name: simple-http-server
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "simple-http-server-backendconfig"}'
+    # Reserve and reference a static external IP created in Terraform
+    # (replace with the actual IP name/address from terraform output)
+    networking.gke.io/load-balancer-type: "External"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: "" # set to terraform-managed static IP if using regional external LB
+  externalTrafficPolicy: Local
+  sessionAffinity: ClientIP
+  selector:
+    app.kubernetes.io/name: simple-http-server
   ports:
     - name: http
       port: 80
@@ -38,36 +66,6 @@ spec:
     port: 8080
   timeoutSec: 30
   connectionDraining:
-    drainingTimeoutSec: 30
----
-apiVersion: networking.gke.io/v1
-kind: ManagedCertificate
-metadata:
-  name: simple-http-server-cert
-  namespace: simple-http-server
-spec:
-  domains:
-    - example.com
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: simple-http-server-ingress
-  namespace: simple-http-server
-  annotations:
-    kubernetes.io/ingress.class: "gce"
-    kubernetes.io/ingress.global-static-ip-name: "simple-http-server-ip"
-    networking.gke.io/managed-certificates: "simple-http-server-cert"
-    kubernetes.io/ingress.allow-http: "true"
-spec:
-  rules:
-    - host: example.com
-      http:
-        paths:
-          - path: /*
-            pathType: ImplementationSpecific
-            backend:
-              service:
-                name: simple-http-server
-                port:
-                  number: 80
+    drainingTimeoutSec: 60
+  sessionAffinity:
+    affinityType: "CLIENT_IP"
