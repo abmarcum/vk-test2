@@ -1,0 +1,20 @@
+{
+  "files": [
+    {
+      "path": "main.go",
+      "description": "Entry point: process lifecycle, config loading, logger construction, TLS listener setup, HTTP/HTTPS server bootstrap, mux route wiring (healthz/metrics/proxy/redirect), signal handling (SIGTERM/SIGHUP), and graceful shutdown orchestration."
+    },
+    {
+      "path": "config.go",
+      "description": "Config struct definitions (Server, TLS, Timeouts, Routes, Pools, HealthCheck, Backend), YAML parsing via LoadConfig, config validation, and TLS material resolution from file path or GCP Secret Manager."
+    },
+    {
+      "path": "proxy.go",
+      "description": "Router construction and path matching, ReverseProxy Director/ModifyResponse/ErrorHandler hooks, request-scoped proxy state propagation, structured logging and metrics middleware, Prometheus metrics registration, healthz/metrics HTTP handlers, and HTTPS redirect handler."
+    },
+    {
+      "path": "balancer.go",
+      "description": "Backend and Pool state structures, load balancing Strategy interface with round-robin/least-connections/random implementations, active health check goroutine loop, and passive failure/success marking for backends."
+    }
+  ]
+}
