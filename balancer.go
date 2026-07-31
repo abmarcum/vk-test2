@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -202,7 +203,97 @@ func (p *Pool) MarkSuccess(b *Backend) {
 	}
 }
 
-// healthCheckClient is a hardened HTTP client used exclusively for active
-// health probing: it does not follow redirects, and enforces a minimum
-// TLS version for HTTPS backend targets.
-func newHealthC
+// joinPath joins a base health-check-adjacent path with an extra path
+// segment. If extra is empty, base is returned unchanged. If extra is an
+// absolute path (leading "/"), it overrides base entirely. Otherwise extra
+// is appended to base with exactly one separating slash.
+func joinPath(base, extra string) string {
+	if extra == "" {
+		return base
+	}
+	if strings.HasPrefix(extra, "/") {
+		return extra
+	}
+	if base == "" {
+		return "/" + extra
+	}
+	if strings.HasSuffix(base, "/") {
+		return base + extra
+	}
+	return base + "/" + extra
+}
+
+// newHealthCheckClient builds a hardened HTTP client used exclusively for
+// active health probing: it does not follow redirects, and applies the
+// pool's configured timeout to each probe request.
+func newHealthCheckClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// RunHealthChecks runs the active health-check loop for this pool until
+// ctx is canceled, probing every backend on the configured interval.
+func (p *Pool) RunHealthChecks(ctx context.Context, logger *log.Logger) {
+	interval := p.HealthCheck.IntervalDur
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	timeout := p.HealthCheck.TimeoutDur
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	path := p.HealthCheck.Path
+	if path == "" {
+		path = "/healthz"
+	}
+
+	client := newHealthCheckClient(timeout)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	probe := func() {
+		for _, b := range p.Backends {
+			target := joinPath(b.URL.String(), strings.TrimPrefix(path, "/"))
+			if strings.HasPrefix(path, "/") {
+				target = strings.TrimSuffix(b.URL.String(), "/") + path
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+			if err != nil {
+				p.MarkFailure(b)
+				continue
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				p.MarkFailure(b)
+				if logger != nil {
+					logger.Printf("WARN health check failed pool=%s backend=%s err=%v", p.Name, b.URL.Host, err)
+				}
+				continue
+			}
+			resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+				p.MarkSuccess(b)
+			} else {
+				p.MarkFailure(b)
+			}
+		}
+	}
+
+	// Run an initial probe immediately so backends can be validated before
+	// the first interval elapses.
+	probe()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probe()
+		}
+	}
+}
