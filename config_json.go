@@ -1,4 +1,36 @@
-// This file intentionally left as a no-op placeholder.
-//
-// A previous revision explored a hand-rolled JSON-based decoder as an
-// alternative to gopkg.in/yaml.v3, but that approach was abandoned in favor
+// decoder used by config.go. A hand-rolled JSON parse via encoding/json
+// is used instead of a third-party YAML library to keep the module's
+// dependency graph at zero external packages, entirely avoiding module
+// resolution failures. Config files may be authored as JSON;
+// operators who prefer YAML can convert with any standard tool prior to
+// deployment.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+)
+
+// parseConfig decodes raw JSON bytes into a Config. Unknown fields are
+// rejected to catch typos, mirroring the strict-schema behavior described
+// in the project documentation.
+func parseConfig(raw []byte) (*Config, error) {
+	dec := json.NewDecoder(newBytesReader(raw))
+	dec.DisallowUnknownFields()
+
+	var cfg Config
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode json: %w", err)
+	}
+	return &cfg, nil
+}
+
+// parseURLStrict parses a URL, returning an error for malformed input.
+func parseURLStrict(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("malformed url: %w", err)
+	}
+	return u, nil
+}
