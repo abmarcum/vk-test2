@@ -1,39 +1,68 @@
-# GoProxy API Documentation
+# GoProxy — API & Endpoint Reference
 
-GoProxy exposes three categories of HTTP surface on **both** the HTTP and
-HTTPS listeners (they share the same `http.Handler`):
+This document describes every HTTP-level surface exposed directly by the GoProxy process itself: the built-in operational endpoints (`/healthz`, `/metrics`) and the semantics of the reverse-proxy data plane (`/*`). It does **not** document the API surface of upstream backend services — those are opaque to GoProxy and are simply forwarded.
 
-1. Operational endpoints: `/healthz`, `/metrics`.
-2. The reverse-proxy data plane: every other path, matched against
-   configured routes and forwarded to an upstream backend.
+Both the HTTP listener (`server.http_addr`) and, when TLS is enabled, the HTTPS listener (`server.https_addr`) serve an identical routing table (the same `http.Handler` / `Mux` instance is shared by both `http.Server`s).
 
-All responses are plain text unless otherwise noted. There is no
-authentication layer; place GoProxy behind a trusted network boundary or
-add authentication at the upstream services if required.
+---
+
+## Table of Contents
+
+- [Base URLs](#base-urls)
+- [Authentication](#authentication)
+- [`GET /healthz`](#get-healthz)
+- [`GET /metrics`](#get-metrics)
+- [Reverse Proxy Data Plane (`/*`)](#reverse-proxy-data-plane-)
+- [Routing Semantics](#routing-semantics)
+- [Load Balancing Strategies](#load-balancing-strategies)
+- [Health Checking](#health-checking)
+- [Error Responses](#error-responses)
+- [Forwarded Request Headers](#forwarded-request-headers)
+
+---
+
+## Base URLs
+
+| Listener | Default Address | Enabled When |
+|---|---|---|
+| HTTP  | `http://<host>:8080`  | Always |
+| HTTPS | `https://<host>:8443` | `server.enable_tls: true` |
+
+Addresses are configurable via `server.http_addr` / `server.https_addr` in `config.yaml`.
+
+## Authentication
+
+GoProxy performs no authentication or authorization of its own on `/healthz`, `/metrics`, or the proxy data plane. Access control (if required) must be enforced at the network layer (firewall/security group), via an upstream identity-aware proxy, or by the backend services themselves.
 
 ---
 
 ## `GET /healthz`
 
-Liveness probe suitable for load balancer / orchestrator health checks
-(e.g. Kubernetes `readinessProbe`/`livenessProbe`).
-
-**Behavior**
-
-- Returns `200 OK` with body `ok` if **at least one** backend, across
-  **any** configured pool, currently has `Alive == true`.
-- Returns `200 OK` with body `ok` if **no pools are configured** at all
-  (vacuously healthy).
-- Returns `503 Service Unavailable` with body `unavailable` if every
-  configured backend is currently marked unhealthy.
+Liveness/readiness probe endpoint intended for load balancers, container orchestrators (Kubernetes `readinessProbe`/`livenessProbe`), and uptime monitors.
 
 **Request**
 
 ```
 GET /healthz HTTP/1.1
+Host: proxy.example.com
 ```
 
-**Response — healthy**
+**Behavior**
+
+Returns `200 OK` if **at least one backend, in any configured pool, is currently marked `Alive`**, or if **no pools are configured at all** (vacuously healthy). Returns `503 Service Unavailable` otherwise. This check exposes only a boolean signal — it never leaks pool or backend identity/topology.
+
+**Responses**
+
+| Status | Content-Type | Body | Condition |
+|---|---|---|---|
+| `200 OK` | `text/plain` | `ok` | ≥1 backend alive, or zero pools configured |
+| `503 Service Unavailable` | `text/plain` | `unavailable` | All configured backends across all pools are unhealthy |
+
+**Example**
+
+```bash
+curl -i http://localhost:8080/healthz
+```
 
 ```
 HTTP/1.1 200 OK
@@ -42,151 +71,147 @@ Content-Type: text/plain
 ok
 ```
 
-**Response — unhealthy**
-
-```
-HTTP/1.1 503 Service Unavailable
-Content-Type: text/plain
-
-unavailable
-```
-
-> This endpoint reports an **aggregate, anonymized** signal only — it
-> never reveals individual pool or backend identity/state.
-
 ---
 
 ## `GET /metrics`
 
-Plain-text metrics snapshot (not Prometheus-exposition-format guaranteed,
-but designed to be human- and scrape-friendly). Content type is
-`text/plain`.
+Plain-text metrics exposition endpoint for scraping by monitoring systems. Metrics are held in an in-process registry (`Metrics`) and reset on process restart.
 
 **Request**
 
 ```
 GET /metrics HTTP/1.1
+Host: proxy.example.com
 ```
 
 **Response**
 
-```
-HTTP/1.1 200 OK
-Content-Type: text/plain
+`200 OK`, `Content-Type: text/plain`, body is the current snapshot of all counters and gauges (one metric per line; format produced by `Metrics.WriteTo`).
 
-proxy_requests_total 1523
-proxy_requests_failed_total 4
+**Metrics emitted by the proxy data plane**
+
+| Metric | Type | Description |
+|---|---|---|
+| `proxy_requests_total` | counter | Incremented once per proxied request that completes (successfully or with an upstream error already handled by `ErrorHandler`). |
+| `proxy_requests_failed_total` | counter | Incremented when a request cannot be routed (`404`), no healthy backend is available (`503`), or the upstream reverse proxy reports an error (`502`). |
+| `proxy_last_request_duration_seconds` | gauge | Wall-clock duration of the most recently completed proxied request, in seconds. |
+
+**Example**
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+```
+proxy_requests_total 128
+proxy_requests_failed_total 3
 proxy_last_request_duration_seconds 0.014213
 ```
 
-**Metric reference**
-
-| Metric name                              | Type    | Description |
-|-------------------------------------------|---------|--------------|
-| `proxy_requests_total`                    | counter | Incremented once per proxied request that reaches `ServeHTTP` completion (including upstream errors). |
-| `proxy_requests_failed_total`              | counter | Incremented when a request fails to route (no matching pool → `404`), has no healthy backend (`503`), or the upstream returns a proxy/transport error (`502`). |
-| `proxy_last_request_duration_seconds`      | gauge   | Wall-clock duration, in seconds, of the most recently completed proxy round trip. |
+> Note: the exact line format is produced by the internal `Metrics.WriteTo` writer and is intended for human/simple scraper consumption; it is not guaranteed to be strict Prometheus exposition format unless the metric naming/line format already matches it.
 
 ---
 
-## Reverse-Proxy Data Plane — `ANY /*`
+## Reverse Proxy Data Plane (`/*`)
 
-Every request whose path is **not** `/healthz` or `/metrics` is handled by
-the `ProxyServer`:
+Any request path not matched by `/healthz` or `/metrics` is handled by `ProxyServer`, which:
 
-1. **Routing** — `Router.Match` finds the **longest matching path prefix**
-   among configured `routes[].match` entries and resolves the associated
-   pool.
-   - No match → `404 Not Found` (`not found`), and
-     `proxy_requests_failed_total` is incremented.
+1. Resolves the request path to a `Pool` via the `Router` (longest matching route prefix — see [Routing Semantics](#routing-semantics)).
+2. Selects a healthy `Backend` from that pool via the pool's configured `Strategy` (see [Load Balancing Strategies](#load-balancing-strategies)).
+3. Forwards the request to the backend using `net/http/httputil.ReverseProxy`, rewriting `Host` to the backend's host and adding standard forwarding headers (see [Forwarded Request Headers](#forwarded-request-headers)).
+4. Streams the backend's response back to the client unmodified (status code, headers, and body).
+5. Records passive health state (`MarkSuccess` / `MarkFailure`) and updates metrics based on the outcome.
 
-2. **Backend selection** — `Pool.Choose` asks the pool's configured
-   `Strategy` (`round_robin` | `least_connections` | `random`) for the
-   next backend, considering only backends currently marked `Alive`.
-   - No alive backend → `503 Service Unavailable`
-     (`no healthy backends available`), and
-     `proxy_requests_failed_total` is incremented.
-
-3. **Forwarding** — the request is forwarded via
-   `httputil.NewSingleHostReverseProxy` with:
-   - `Host` header rewritten to the backend's host.
-   - `X-Forwarded-For` set to the client's IP (parsed from
-     `RemoteAddr`).
-   - `X-Forwarded-Proto` set to `http` or `https` depending on the
-     inbound listener.
-   - `X-Forwarded-Host` set to the original `Host` header from the
-     client request.
-
-4. **Upstream error handling** — if the reverse proxy cannot reach or
-   read from the backend, the client receives `502 Bad Gateway`
-   (`bad gateway`), `proxy_requests_failed_total` is incremented, and the
-   backend's passive failure counter is incremented
-   (`Pool.MarkFailure`).
-
-5. **Passive health accounting** — on a response that completes without
-   a transport-level error, `Pool.MarkSuccess` resets the backend's
-   failure streak and, once `healthy_threshold` consecutive successes
-   accumulate, restores `Alive = true`. Conversely, `Pool.MarkFailure`
-   resets the success streak and, once `unhealthy_threshold` consecutive
-   failures accumulate, sets `Alive = false`, removing the backend from
-   the healthy candidate pool used by every `Strategy`.
-
-### Example
-
-Given the routing/pool configuration:
-
-```yaml
-routes:
-  - match: "/api"
-    pool: "api_pool"
-pools:
-  - name: "api_pool"
-    strategy: "round_robin"
-    backends:
-      - url: "http://10.0.0.1:9000"
-      - url: "http://10.0.0.2:9000"
-```
-
-Request:
+**Request**
 
 ```
-GET /api/users/42 HTTP/1.1
+<ANY METHOD> /<any-path> HTTP/1.1
 Host: proxy.example.com
 ```
 
-is routed to `api_pool`, load-balanced round-robin across the two
-backends, and forwarded as:
+All HTTP methods, headers, query strings, and bodies are transparently proxied; GoProxy imposes no additional constraints beyond the configured server timeouts (`server.timeouts.*`).
 
-```
-GET /api/users/42 HTTP/1.1
-Host: 10.0.0.1:9000
-X-Forwarded-For: 203.0.113.7
-X-Forwarded-Proto: https
-X-Forwarded-Host: proxy.example.com
-```
+**Response**
 
-### Response Status Summary
-
-| Status | Condition |
-|--------|-----------|
-| `2xx/3xx/4xx` (from upstream) | Backend response, returned unmodified to the client. |
-| `404 Not Found` | No route matches the request path. |
-| `502 Bad Gateway` | Selected backend was unreachable or returned a transport-level proxy error. |
-| `503 Service Unavailable` | Route matched, but no backend in the target pool is currently marked healthy. |
+The backend's raw response is returned as-is, except in the failure conditions described in [Error Responses](#error-responses).
 
 ---
 
-## Active Health Checks (Background, Not Client-Facing)
+## Routing Semantics
 
-For pools with `health_check.enabled: true`, GoProxy independently issues
-periodic `GET` requests to `health_check.path` on **every** backend
-(default path `/healthz`, default interval `10s`, default timeout `2s`).
-This is a **server-side probing loop**, not a client-callable API:
+- Routes are configured as `{match: "<prefix>", pool: "<pool-name>"}` under the top-level `routes:` list.
+- Matching is **longest-prefix-match**: among all routes whose `match` value is a prefix of the request path, the one with the longest prefix string wins.
+- If no configured route prefix matches the request path, the proxy returns `404 Not Found` (see [Error Responses](#error-responses)).
+- Each `pool` referenced by a route **must** exist in the `pools:` list; unknown pool references cause the server to fail fast at startup (`build router: route %q references unknown pool %q`).
 
-- HTTP status `200–399` → counts as a probe success.
-- Any other status, or a request error, → counts as a probe failure.
-- Redirects are **not** followed (`http.ErrUseLastResponse`).
-- Threshold hysteresis (`healthy_threshold` / `unhealthy_threshold`)
-  applies identically to active and passive signals, sharing the same
-  `Alive` state consumed by `Pool.Choose` and reported (in aggregate) via
-  `GET /healthz`.
+Example: given routes `["/api/" -> api_pool, "/" -> web_pool]`, a request to `/api/users/1` matches `/api/` (longer prefix) and is routed to `api_pool`; a request to `/index.html` matches only `/` and is routed to `web_pool`.
+
+---
+
+## Load Balancing Strategies
+
+Configured per-pool via `pools[].strategy`:
+
+| Strategy | Config value | Selection Algorithm |
+|---|---|---|
+| Round Robin *(default)* | `round_robin` | Cycles through currently-alive backends in order using an atomic monotonically increasing cursor. |
+| Least Connections | `least_connections` | Selects the alive backend with the fewest in-flight (`ActiveConns`) requests; ties resolved by first-seen order. |
+| Random | `random` | Selects a uniformly pseudo-random alive backend (time-seeded, non-cryptographic — suitable only for load distribution, not security). |
+
+Only backends currently marked `Alive` participate in selection. If a pool has zero alive backends, `Pool.Choose()` returns `ErrNoHealthyBackends`, and the proxy responds `503 Service Unavailable`.
+
+---
+
+## Health Checking
+
+GoProxy combines **active** and **passive** health checking per pool:
+
+### Active Health Checks
+
+When `pools[].health_check.enabled: true`, a background goroutine (`Pool.RunHealthChecks`) issues a `GET` request to `health_check.path` (default `/healthz`) against every backend in the pool on a fixed `interval` (default `10s`), using a client with `timeout` (default `2s`) that does not follow redirects.
+
+- A response with status `200–399` counts as a **success**.
+- Any other status, or a transport-level error, counts as a **failure**.
+
+### Passive Health Checks
+
+Every live proxied request outcome also feeds the same hysteresis counters:
+
+- `ProxyServer` calls `Pool.MarkSuccess(backend)` after a proxied request completes without a reverse-proxy transport error.
+- `ProxyServer` calls `Pool.MarkFailure(backend)` when `httputil.ReverseProxy`'s `ErrorHandler` fires (upstream unreachable, timeout, etc.), and responds `502 Bad Gateway` to the client.
+
+### Hysteresis Thresholds
+
+| Config field | Default | Effect |
+|---|---|---|
+| `unhealthy_threshold` | `3` | Consecutive failures (active or passive) required before a backend transitions `Alive → false`. |
+| `healthy_threshold` | `2` | Consecutive successes required before a backend transitions `Alive → true`. |
+
+Backends start `Alive = true` at process startup (optimistic) so they can serve traffic immediately, and are only marked down after crossing `unhealthy_threshold`.
+
+---
+
+## Error Responses
+
+| Status | Trigger | Body |
+|---|---|---|
+| `404 Not Found` | No configured route matches the request path. | `not found` |
+| `503 Service Unavailable` | Route matched, but the target pool has no currently healthy (`Alive`) backend. | `no healthy backends available` |
+| `502 Bad Gateway` | Route and backend resolved, but the upstream request failed (connection error, timeout, etc.). | `bad gateway` |
+
+All error bodies are `text/plain`. Each error path also increments `proxy_requests_failed_total` and, in the `502` case, marks the selected backend's passive failure counter via `Pool.MarkFailure`.
+
+---
+
+## Forwarded Request Headers
+
+For every proxied request, GoProxy's `ProxyServer.Director` sets/overrides the following headers before forwarding to the backend:
+
+| Header | Value |
+|---|---|
+| `Host` | Rewritten to the backend's own host (`backend.URL.Host`) |
+| `X-Forwarded-For` | The client's IP address, extracted from `r.RemoteAddr` |
+| `X-Forwarded-Proto` | `https` if the inbound connection was TLS-terminated at GoProxy, otherwise `http` |
+| `X-Forwarded-Host` | The original `Host` header supplied by the client |
+
+Backends should rely on these headers (rather than the raw connection) to reconstruct the original client identity and requested scheme/host, standard practice for services sitting behind a reverse proxy.
