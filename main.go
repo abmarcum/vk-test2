@@ -1,3 +1,24 @@
-// config loading invocation, TLS listener construction, HTTP server
-// bootstrap, signal handling (SIGTERM/SIGHUP), graceful shutdown/drain, and
-// top-level wiring of Router <-> Pool <-> health checking. It does not own
+// Package main implements the GoProxy entry point: process lifecycle,
+// config loading, logger construction, TLS listener setup, HTTP/HTTPS
+// server bootstrap, mux route wiring (healthz/metrics/proxy/redirect),
+// signal handling (SIGTERM/SIGHUP), and graceful shutdown orchestration.
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+)
+
+// healthCheckerAdapter bridges balancer.go's Pool state to proxy.go's
