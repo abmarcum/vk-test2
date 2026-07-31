@@ -1,276 +1,400 @@
-# GoProxy — HTTP API & Metrics Reference
+# goproxy Reference
 
-This document describes the HTTP surface exposed by GoProxy: operational endpoints (`/healthz`, `/metrics`), the proxied data-plane behavior, and the full Prometheus metrics catalog.
+This document is the authoritative reference for:
 
----
-
-## Endpoint Precedence
-
-The top-level router (`NewMux`) registers endpoints in the following precedence order, **regardless of user-configured `routes`**:
-
-1. `GET|HEAD /healthz` — liveness/readiness probe.
-2. `GET /metrics` — Prometheus metrics.
-3. `/*` — catch-all, dispatched to the configured reverse proxy router.
-
-This guarantees operational endpoints remain reachable even if an operator configures a route with `path_prefix: "/"` or `path_prefix: "/healthz"`.
+1. The YAML configuration schema.
+2. The HTTP operational endpoints (`/healthz`, `/metrics`).
+3. The Prometheus metrics catalog.
+4. Internal HTTP behaviors relevant to operators and integrators
+   (headers, error responses, redirect semantics).
 
 ---
 
-## `GET /healthz`
+## 1. Configuration Schema
 
-Liveness/readiness probe endpoint. Always available on both HTTP and HTTPS listeners (including when the HTTP listener is otherwise redirecting all traffic to HTTPS).
+The server is configured via a single YAML file, loaded once at process
+startup via `LoadConfig`. Unknown top-level or nested keys cause a load-time
+error (strict schema). All duration fields are Go duration strings (e.g.
+`"5s"`, `"250ms"`, `"2m"`).
 
-### Request
+### Top level
 
-- Methods: `GET`, `HEAD`
-- No parameters, headers, or body required.
-
-### Responses
-
-| Status | Condition | Body |
-|---|---|---|
-| `200 OK` | At least one backend across all pools is healthy (or no `HealthChecker` is configured). | `{"status":"ok"}` |
-| `503 Service Unavailable` | No pool has any healthy backend. | `{"status":"unhealthy"}` |
-| `405 Method Not Allowed` | Method other than `GET`/`HEAD`. | `method not allowed` (plain text), `Allow: GET, HEAD` header set. |
-
-### Response headers
-
-- `Content-Type: application/json; charset=utf-8`
-- `Cache-Control: no-store`
-
-### Notes
-
-- This endpoint never returns per-backend detail, internal errors, or pool names — only an aggregate boolean status, by design (avoids leaking topology to unauthenticated callers).
-- Intended for use as a Kubernetes readiness/liveness probe or external load-balancer health check target.
-
-### Example
-
-```bash
-curl -i http://localhost:8080/healthz
+```yaml
+server: Server      # required
+routes: [Route]      # required, at least one
+pools:  [Pool]        # required, at least one
 ```
 
-```
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=utf-8
-Cache-Control: no-store
+### `server`
 
-{"status":"ok"}
-```
+| Field                    | Type    | Default | Description |
+|--------------------------|---------|---------|--------------|
+| `http_addr`              | string  | `":8080"` | Listen address for plaintext HTTP. |
+| `https_addr`             | string  | `":8443"` | Listen address for HTTPS. |
+| `enable_tls`             | bool    | `false` | Enables the HTTPS listener and cert resolution. |
+| `tls`                    | TLS     | see below | TLS configuration block. |
+| `timeouts`               | Timeouts | see below | Server + proxy timing tunables. |
+| `shutdown_grace_seconds` | int     | `30` | Seconds allowed for graceful shutdown to drain in-flight requests. |
 
----
+**Validation**: at least one of `http_addr`/`https_addr` must be non-empty.
 
-## `GET /metrics`
+### `server.tls`
 
-Exposes all application metrics in Prometheus text exposition format. Backed by a dedicated `prometheus.Registry` (not the global default registry), so scraping this endpoint returns exactly the metrics documented below plus standard Go/process collectors.
+| Field              | Type   | Default  | Description |
+|--------------------|--------|----------|--------------|
+| `cert_source`      | string | `"file"` | `"file"` or `"secretmanager"`. |
+| `cert_file`        | string | —        | Required when `cert_source: file`. Path to PEM certificate. |
+| `key_file`         | string | —        | Required when `cert_source: file`. Path to PEM private key. |
+| `cert_secret_name` | string | —        | Required when `cert_source: secretmanager`. Full resource name, e.g. `projects/p/secrets/cert/versions/latest`. |
+| `key_secret_name`  | string | —        | Required when `cert_source: secretmanager`. Same format as above. |
+| `min_version`      | string | `"1.2"`  | Minimum TLS version. Must be `"1.2"` or `"1.3"`. |
 
-### Request
+**Validation** (only enforced when `enable_tls: true`):
+- `cert_source` must be `file` or `secretmanager`.
+- The corresponding cert/key fields for the chosen source must be set.
+- `min_version` must be `"1.2"` or `"1.3"`.
+- Resolved certificate/key material must be non-empty after loading
+  (from disk or Secret Manager).
 
-- Method: `GET`
-- No parameters.
+Certificate material is resolved **once**, at config load time, and cached
+in memory (`CertPEM`/`KeyPEM`); these fields are never serialized back out.
 
-### Response
+### `server.timeouts`
 
-- `Content-Type: text/plain; version=0.0.4` (standard Prometheus exposition format)
-- Compression: supported (gzip, if requested via `Accept-Encoding`).
+All values are duration strings.
 
-### Example
+| Field          | Default | Applies to |
+|----------------|---------|------------|
+| `read_header`  | `5s`   | `http.Server.ReadHeaderTimeout` |
+| `read`         | `15s`  | `http.Server.ReadTimeout` |
+| `write`        | `15s`  | `http.Server.WriteTimeout` |
+| `idle`         | `60s`  | `http.Server.IdleTimeout` |
+| `dial`         | `5s`   | Outbound dial timeout to backends |
+| `proxy_total`  | `30s`  | Overall per-request proxy budget |
 
-```bash
-curl -s http://localhost:8080/metrics | grep goproxy_
-```
+### `routes` (list of `Route`)
 
----
+| Field         | Type   | Required | Description |
+|---------------|--------|----------|--------------|
+| `path_prefix` | string | yes      | Must start with `/`. Matched using longest-prefix-match. |
+| `pool`        | string | yes      | Name of a pool defined in `pools`. Must reference an existing pool. |
 
-## Metrics Catalog
+Routing precedence: the **longest matching `path_prefix` wins**, regardless
+of the order routes are declared in the file. `/healthz` and `/metrics` are
+always handled by the server itself and take precedence over any configured
+route, even `path_prefix: "/"`.
 
-All application metrics are namespaced with `goproxy_`. Standard Go runtime (`go_*`) and process (`process_*`) collectors are also registered.
+### `pools` (list of `Pool`)
 
-### `goproxy_requests_total`
+| Field          | Type          | Default        | Description |
+|----------------|---------------|-----------------|--------------|
+| `name`         | string        | —               | Required, unique across all pools. |
+| `strategy`     | string        | `"round_robin"` | One of `round_robin`, `least_connections`, `random`. |
+| `health_check` | HealthCheck   | see below       | Active health check configuration. |
+| `backends`     | list[Backend] | —               | Required, at least one entry. |
 
-**Type:** Counter
+### `pools[].health_check`
 
-Total number of proxied HTTP requests, labeled by outcome.
+| Field                 | Type   | Default      | Description |
+|-----------------------|--------|--------------|--------------|
+| `enabled`             | bool   | `false`      | Enables active probing for this pool. |
+| `path`                | string | `"/healthz"` | Must start with `/`. Probed relative to each backend's base URL. |
+| `interval`            | string | `"10s"`      | Time between probe rounds. |
+| `timeout`             | string | `"2s"`       | Per-probe timeout. |
+| `healthy_threshold`   | int    | `2`          | Consecutive successes required to mark a backend healthy. |
+| `unhealthy_threshold` | int    | `3`          | Consecutive failures required to mark a backend unhealthy. |
 
-| Label | Description |
-|---|---|
-| `route` | Matched route path prefix, or `unmatched` if no route matched the request path. |
-| `pool` | Matched pool name, or `none` if no pool was resolved. |
-| `method` | HTTP method (`GET`, `POST`, etc.). |
-| `status` | HTTP response status code sent to the client. |
+A backend is considered healthy on probe response status `200–399` unless a
+specific expected status is configured internally. Thresholds also govern
+**passive** health adjustments derived from live proxied traffic outcomes
+(not just active probes).
 
----
+### `pools[].backends[]` (`Backend`)
 
-### `goproxy_request_duration_seconds`
+| Field    | Type   | Default | Description |
+|----------|--------|---------|--------------|
+| `url`    | string | —       | Required. Absolute URL, scheme must be `http` or `https`, non-empty host. |
+| `weight` | int    | `1`     | Currently informational; must be `>= 0`. |
 
-**Type:** Histogram
+**Validation**: `url` is parsed and rejected if malformed, missing a scheme,
+using an unsupported scheme, or missing a resolvable host — including edge
+cases like `http://:8080` or `http://user@/path` where the URL parses but no
+real hostname is present.
 
-End-to-end latency of proxied requests, from entry into `ProxyServer.ServeHTTP` to completion of the response write.
+### Full example
 
-| Label | Description |
-|---|---|
-| `route` | Matched route path prefix, or `unmatched`. |
-| `pool` | Matched pool name, or `none`. |
-| `method` | HTTP method. |
+```yaml
+server:
+  http_addr: ":8080"
+  https_addr: ":8443"
+  enable_tls: true
+  tls:
+    cert_source: "file"
+    cert_file: "/etc/goproxy/tls.crt"
+    key_file: "/etc/goproxy/tls.key"
+    min_version: "1.3"
+  timeouts:
+    read_header: "5s"
+    read: "15s"
+    write: "15s"
+    idle: "60s"
+    dial: "5s"
+    proxy_total: "30s"
+  shutdown_grace_seconds: 30
 
-**Buckets (seconds):** `0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5`
+routes:
+  - path_prefix: "/api/"
+    pool: "api"
+  - path_prefix: "/"
+    pool: "web"
 
----
+pools:
+  - name: "api"
+    strategy: "least_connections"
+    health_check:
+      enabled: true
+      path: "/internal/health"
+      interval: "5s"
+      timeout: "1s"
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+    backends:
+      - url: "http://10.0.1.10:8080"
+        weight: 1
+      - url: "http://10.0.1.11:8080"
+        weight: 1
 
-### `goproxy_in_flight_requests`
-
-**Type:** Gauge
-
-Number of requests currently in flight to a given pool. Incremented when a backend is selected by the Director, decremented in `ModifyResponse` (success path) or `ErrorHandler` (failure path).
-
-| Label | Description |
-|---|---|
-| `pool` | Pool name. |
-
----
-
-### `goproxy_upstream_errors_total`
-
-**Type:** Counter
-
-Total count of upstream/proxy errors, categorized by reason.
-
-| Label | Description |
-|---|---|
-| `pool` | Pool name, or `none` if no pool was resolved. |
-| `reason` | One of: `no_healthy_backend`, `no_route`, `timeout`, `client_closed`, `bad_gateway`. |
-
-**Reason → client status mapping:**
-
-| `reason` | HTTP status returned to client |
-|---|---|
-| `no_healthy_backend` | `503 Service Unavailable` |
-| `no_route` | `404 Not Found` |
-| `timeout` | `504 Gateway Timeout` |
-| `client_closed` | `499` (nginx convention; client disconnected before response) |
-| `bad_gateway` | `502 Bad Gateway` (default/fallback) |
-
----
-
-### `goproxy_backend_up`
-
-**Type:** Gauge
-
-Current health state of an individual backend, as determined by active and/or passive health checking.
-
-| Label | Description |
-|---|---|
-| `pool` | Pool name. |
-| `backend` | Backend URL string. |
-
-**Values:** `1` = healthy, `0` = unhealthy.
-
----
-
-### `goproxy_response_size_bytes`
-
-**Type:** Histogram
-
-Size, in bytes, of the response body returned to the client for proxied requests.
-
-| Label | Description |
-|---|---|
-| `route` | Matched route path prefix, or `unmatched`. |
-| `pool` | Matched pool name, or `none`. |
-
-**Buckets:** Exponential, starting at 128 bytes, factor 4, 8 buckets (`128, 512, 2048, 8192, 32768, 131072, 524288, 2097152`).
-
----
-
-## Data-Plane (Proxy) Behavior
-
-All requests not matched by `/healthz` or `/metrics` are handled by `ProxyServer`, which performs:
-
-1. **Routing** — longest-prefix match of `r.URL.Path` against configured `routes[].path_prefix`. No match → `404 Not Found`.
-2. **Backend selection** — the matched pool's configured `Strategy` (`round_robin` / `least_connections` / `random`) selects a healthy backend. No healthy backend → `503 Service Unavailable`.
-3. **Header processing**:
-   - Hop-by-hop headers (RFC 7230 §6.1) are stripped from both the inbound request and the upstream response.
-   - `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For` are set/appended on the outbound request.
-   - `X-Forwarded-For-Pool` is set to the matched pool name.
-   - Response headers `Server` and `X-Powered-By` are stripped before returning to the client.
-   - `X-Content-Type-Options: nosniff` is added to all proxied responses.
-4. **Error handling** — all upstream/backend failures are translated to one of the status codes in the [`goproxy_upstream_errors_total`](#goproxy_upstream_errors_total) table above. Response bodies are always generic JSON:
-
-   ```json
-   {"error":"service unavailable"}
-   ```
-
-   No backend hostnames, stack traces, or internal error strings are ever included in client-facing responses.
-
-5. **Streaming** — the proxy supports streaming responses (e.g. Server-Sent Events) via periodic flush (`FlushInterval: 100ms`) and `http.Flusher` passthrough.
-
-### Example error response
-
-```bash
-curl -i http://localhost:8080/api/unknown-path
-```
-
-```
-HTTP/1.1 404 Not Found
-Content-Type: application/json; charset=utf-8
-
-{"error":"not found"}
-```
-
-```bash
-# All backends in the matched pool are down
-curl -i http://localhost:8080/api/orders
-```
-
-```
-HTTP/1.1 503 Service Unavailable
-Content-Type: application/json; charset=utf-8
-
-{"error":"service unavailable"}
+  - name: "web"
+    strategy: "round_robin"
+    health_check:
+      enabled: true
+    backends:
+      - url: "http://10.0.2.10:80"
+      - url: "http://10.0.2.11:80"
 ```
 
 ---
 
-## HTTPS Redirect Behavior
+## 2. HTTP Endpoints
 
-When TLS is enabled and both listeners are active, plaintext HTTP requests (other than `/healthz`) are expected to be redirected to HTTPS by `HTTPSRedirectHandler`:
+### `GET|HEAD /healthz`
 
-- Method: any
-- Response: `301 Moved Permanently`
-- `Location`: `https://<host>[:<https_port>]<path>?<query>` (port omitted if `https_port == 443`)
-- `Connection: close` is set to prevent connection reuse across the scheme switch.
+Liveness/readiness probe. Always registered, always takes precedence over
+any configured route, and remains reachable over plaintext HTTP even when
+the HTTP listener is otherwise redirecting to HTTPS.
 
-### Example
+**Responses**
 
-```bash
-curl -i http://example.com/api/orders?id=42
+| Status | Body                          | Meaning |
+|--------|-------------------------------|---------|
+| `200`  | `{"status":"ok"}`             | At least one backend across configured pools is healthy (or no health checker is wired). |
+| `503`  | `{"status":"unhealthy"}`      | No pool currently has a healthy backend. |
+| `405`  | `method not allowed` (plain text) | Method other than GET/HEAD; response includes `Allow: GET, HEAD`. |
+
+Headers: `Content-Type: application/json; charset=utf-8`,
+`Cache-Control: no-store`.
+
+This endpoint **never** includes backend addresses, pool names, or error
+detail — only a boolean-derived overall status, by design.
+
+### `GET /metrics`
+
+Prometheus exposition-format metrics, served from a dedicated registry (see
+§3 below for the full catalog). Standard `promhttp` content negotiation
+applies (supports gzip when requested).
+
+### `/` (catch-all — reverse proxy)
+
+Every other request is matched against the configured `routes` using
+longest-prefix-match and forwarded to a backend selected from the matched
+pool's load-balancing strategy. See §4 for detailed proxy behavior.
+
+### HTTP → HTTPS Redirect
+
+When TLS is enabled, the plaintext HTTP listener should be mounted with the
+HTTPS-redirect handler (excluding `/healthz`, which is registered directly).
+For any other path:
+
+- Responds `301 Moved Permanently`.
+- `Location` preserves the original path and query string.
+- Target host is the request's host, on the configured HTTPS port (omitted
+  from the URL entirely if that port is `443`).
+- Sets `Connection: close` on the redirect response.
+
+Example:
+
 ```
-
-```
-HTTP/1.1 301 Moved Permanently
-Location: https://example.com/api/orders?id=42
-Connection: close
+GET http://example.com/api/orders?x=1
+→ 301 Location: https://example.com/api/orders?x=1   (if https_addr resolves to :443)
+→ 301 Location: https://example.com:8443/api/orders?x=1  (otherwise)
 ```
 
 ---
 
-## Logging Reference
+## 3. Metrics Catalog
 
-Every proxied request produces a single structured log line (via `log/slog`) under the `proxy_request` message with an `http` attribute group containing:
+All metrics are under the `goproxy_` namespace and registered on a
+dedicated Prometheus registry (not the global default registry).
 
-| Field | Description |
-|---|---|
-| `method` | HTTP method. |
-| `path` | Request path (query string always stripped). |
-| `route` | Matched route prefix, or `unmatched`. |
-| `pool` | Matched pool name, or `none`. |
-| `backend` | Selected backend URL, if any. |
-| `status` | Final HTTP status returned to the client. |
-| `duration_ms` | Request duration in milliseconds (float). |
-| `bytes_out` | Bytes written to the client. |
-| `remote_addr` | Best-effort client IP (from `X-Forwarded-For` first hop, or `RemoteAddr`). |
-| `user_agent` | Client `User-Agent` header. |
-| `error` | Present only when an error occurred; sanitized error string. |
+| Metric | Type | Labels | Description |
+|--------|------|--------|--------------|
+| `goproxy_requests_total` | Counter | `route`, `pool`, `method`, `status` | Total proxied requests, by outcome. `route`/`pool` are `"unmatched"`/`"none"` when no route/pool was resolved. |
+| `goproxy_request_duration_seconds` | Histogram | `route`, `pool`, `method` | End-to-end request latency as observed by the proxy. Buckets: `.001`…`5` seconds. |
+| `goproxy_in_flight_requests` | Gauge | `pool` | Number of requests currently being proxied to a given pool. |
+| `goproxy_upstream_errors_total` | Counter | `pool`, `reason` | Count of proxy-side error outcomes. `reason` ∈ `no_healthy_backend`, `no_route`, `timeout`, `client_closed`, `bad_gateway`. |
+| `goproxy_backend_up` | Gauge | `pool`, `backend` | `1` if backend is currently considered healthy, `0` otherwise. Updated by both active and passive health checks. |
+| `goproxy_response_size_bytes` | Histogram | `route`, `pool` | Response body size written to the client. Exponential buckets starting at 128 bytes (×4, 8 buckets). |
 
-Log level is `INFO` for `2xx`/`3xx`, `WARN` for `4xx`, and `ERROR` for `5xx` responses.
+Additionally, standard Go runtime and process collectors are registered
+(`go_*`, `process_*` metric families) for baseline runtime observability.
 
-Panics recovered by `LoggingRecoverMiddleware` are logged as `panic_recovered` with `path` and `method` only — no stack trace or panic value is included in logs or responses.
+### Example queries
+
+Error rate by pool over 5 minutes:
+
+```promql
+sum(rate(goproxy_upstream_errors_total[5m])) by (pool, reason)
+```
+
+p99 latency for a specific route:
+
+```promql
+histogram_quantile(0.99,
+  sum(rate(goproxy_request_duration_seconds_bucket{route="/api/"}[5m])) by (le)
+)
+```
+
+Backend health at a glance:
+
+```promql
+goproxy_backend_up == 0
+```
+
+---
+
+## 4. Proxy Behavior Reference
+
+### Routing
+
+- Matching is **prefix-based, longest-match-wins**, computed once at startup
+  by sorting configured routes by descending `path_prefix` length.
+- `/api` will match `/api/v1/x` (no trailing-slash boundary requirement),
+  consistent with common ingress/reverse-proxy conventions.
+- If no route matches the request path, the proxy returns `404`.
+- If a route matches but its pool has no healthy backend, the proxy returns
+  `503`.
+
+### Load Balancing Strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| `round_robin` | Cycles through healthy backends in order using an atomic counter. Default if unset or unrecognized. |
+| `least_connections` | Selects the healthy backend with the fewest current in-flight requests; ties broken by first-seen order. |
+| `random` | Selects a uniformly random healthy backend. |
+
+Backend health is re-evaluated on every selection call — unhealthy backends
+are excluded from candidate sets entirely, not merely deprioritized.
+
+### Health Checking
+
+Two complementary mechanisms feed the same per-backend health state
+(`goproxy_backend_up`):
+
+1. **Active probing** (`RunHealthChecks`): for each pool with
+   `health_check.enabled: true`, a dedicated goroutine probes every backend
+   concurrently on `interval`, issuing a `GET` to `<backend base>/<health
+   check path>` with a hardened client (`healthCheckClient`) that:
+   - Enforces `timeout` per probe.
+   - Does **not** follow redirects (`http.ErrUseLastResponse`), preventing
+     redirect-based probe abuse.
+   - Enforces minimum TLS 1.2 for HTTPS backend probes.
+   - Treats HTTP status `200–399` as healthy by default.
+   - Requires `healthy_threshold` consecutive successes to transition
+     unhealthy → healthy, and `unhealthy_threshold` consecutive failures to
+     transition healthy → unhealthy (hysteresis prevents flapping).
+
+2. **Passive observation**: live proxied request outcomes also feed
+   `MarkSuccess`/`MarkFailure` on a `Backend`, using the same
+   healthy/unhealthy threshold semantics, so a backend that starts failing
+   real traffic is demoted even between active probe intervals.
+
+A freshly constructed `Backend` starts **alive** so it can serve traffic
+immediately at startup, before the first probe cycle completes.
+
+### Header Handling
+
+**Inbound → upstream:**
+
+- All RFC 7230 hop-by-hop headers are stripped (`Connection`,
+  `Proxy-Connection`, `Keep-Alive`, `Proxy-Authenticate`,
+  `Proxy-Authorization`, `Te`, `Trailer`, `Transfer-Encoding`, `Upgrade`).
+- `X-Forwarded-Proto` is set from the actual connection state (`https` if
+  `r.TLS != nil`), falling back to an existing valid value only if already
+  `http`/`https`.
+- `X-Forwarded-Host` is set to the inbound `Host` header.
+- `X-Forwarded-For` is **appended to** (not replaced) with the immediate
+  client IP, parsed from `RemoteAddr` and validated as a real IP literal —
+  unparseable or spoofed values are dropped rather than forwarded, to
+  prevent header-injection style abuse.
+- `X-Forwarded-For-Pool` is set to the resolved pool name (internal
+  diagnostic header).
+
+**Upstream → client:**
+
+- Hop-by-hop headers are stripped again on the response path.
+- `Server` and `X-Powered-By` are removed to avoid leaking backend software
+  identity.
+- `X-Content-Type-Options: nosniff` is added to every proxied response.
+
+### Error Handling & Status Code Mapping
+
+The proxy **never** returns raw upstream error text, stack traces, or
+backend host/port information to clients. All error responses share the
+shape:
+
+```json
+{"error": "<opaque message>"}
+```
+
+with `Content-Type: application/json; charset=utf-8`.
+
+| Condition | Status | Message | Metric `reason` |
+|-----------|--------|---------|-------------------|
+| No route matches the path | `404` | `not found` | `no_route` |
+| Route matched, but pool has no healthy backend | `503` | `service unavailable` | `no_healthy_backend` |
+| Client disconnected before response completed | `499` | `client closed request` | `client_closed` |
+| Upstream round trip exceeded context deadline | `504` | `gateway timeout` | `timeout` |
+| Any other upstream/transport failure | `502` | `bad gateway` | `bad_gateway` |
+
+An in-process panic anywhere in the handler chain is recovered by
+`LoggingRecoverMiddleware`, logged (path/method only, no stack trace in the
+response), and converted to:
+
+```
+500 {"error":"internal server error"}
+```
+
+### Structured Logging
+
+Each completed proxy request emits one log record (`proxy_request`) with an
+`http` attribute group containing:
+
+`method`, `path` (query string stripped), `route`, `pool`, `backend`,
+`status`, `duration_ms`, `bytes_out`, `remote_addr`, `user_agent`, and
+`error` (only if one was recorded on the request's internal proxy state).
+
+Log level is `INFO` for `<400`, `WARN` for `400–499`, `ERROR` for `≥500`.
+
+### Connection Pooling & Timeouts (Upstream Transport)
+
+The reverse proxy's `http.RoundTripper` is configured with:
+
+- `Proxy: nil` — upstream calls **never** honor `HTTP_PROXY`/`HTTPS_PROXY`
+  environment variables, preventing environment-based traffic redirection.
+- Dial timeout `5s`, keep-alive `30s`.
+- `MaxIdleConns: 200`, `MaxIdleConnsPerHost: 50`, `IdleConnTimeout: 90s`.
+- `TLSHandshakeTimeout: 5s`, `ExpectContinueTimeout: 1s`,
+  `ResponseHeaderTimeout: 15s`.
+- HTTP/2 attempted by default (`ForceAttemptHTTP2: true`).
+- `FlushInterval: 100ms` on the `ReverseProxy` to support streaming
+  responses (e.g. Server-Sent Events) without unbounded buffering.
