@@ -1,13 +1,12 @@
-// connections, random), active health-check scheduling, and passive
-// failure/success marking. It does not own HTTP routing, TLS, logging
-// middleware, or metrics emission.
+// strategy implementations (round robin, least connections, random),
+// active health-check scheduling, and passive failure/success marking. It
+// does not own HTTP routing, TLS, logging middleware, or metrics emission.
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"sync/atomic"
@@ -22,6 +21,7 @@ var ErrNoHealthyBackends = errors.New("no healthy backends available")
 // Backend
 // ---------------------------------------------------------------------------
 
+// Backend represents one upstream target and its live health state.
 type Backend struct {
 	URL *url.URL
 
@@ -37,11 +37,8 @@ func newBackend(rawURL string) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse backend url %q: %w", rawURL, err)
 	}
-	if u.Host == "" {
-		return nil, fmt.Errorf("backend url %q missing host", rawURL)
-	}
 	b := &Backend{URL: u}
-	b.Alive.Store(true)
+	b.Alive.Store(true) // starts alive so it can serve traffic immediately
 	return b, nil
 }
 
@@ -63,6 +60,8 @@ func aliveBackends(backends []*Backend) []*Backend {
 	return out
 }
 
+// RoundRobinStrategy cycles through healthy backends in order using an
+// atomic counter.
 type RoundRobinStrategy struct {
 	cursor atomic.Uint64
 }
@@ -76,6 +75,8 @@ func (s *RoundRobinStrategy) Next(backends []*Backend) (*Backend, error) {
 	return alive[idx%uint64(len(alive))], nil
 }
 
+// LeastConnStrategy selects the healthy backend with the fewest current
+// in-flight requests; ties broken by first-seen order.
 type LeastConnStrategy struct{}
 
 func (s *LeastConnStrategy) Next(backends []*Backend) (*Backend, error) {
@@ -95,6 +96,7 @@ func (s *LeastConnStrategy) Next(backends []*Backend) (*Backend, error) {
 	return best, nil
 }
 
+// RandomStrategy selects a uniformly random healthy backend.
 type RandomStrategy struct {
 	counter atomic.Uint64
 }
@@ -104,6 +106,9 @@ func (s *RandomStrategy) Next(backends []*Backend) (*Backend, error) {
 	if len(alive) == 0 {
 		return nil, ErrNoHealthyBackends
 	}
+	// Simple, dependency-free pseudo-randomness: time-seeded atomic
+	// counter mixed with wall-clock nanoseconds. Sufficient for LB
+	// distribution purposes; not used for any security-sensitive purpose.
 	n := s.counter.Add(1)
 	mix := uint64(time.Now().UnixNano()) ^ n
 	return alive[mix%uint64(len(alive))], nil
@@ -124,6 +129,7 @@ func newStrategy(name string) Strategy {
 // Pool
 // ---------------------------------------------------------------------------
 
+// Pool groups backends under one strategy and health-check policy.
 type Pool struct {
 	Name        string
 	Backends    []*Backend
@@ -131,8 +137,8 @@ type Pool struct {
 	HealthCheck HealthCheckConfig
 }
 
-// NewPool constructs a Pool from PoolConf, resolving Strategy by name.
-func NewPool(cfg PoolConf) (*Pool, error) {
+// NewPool constructs a Pool from PoolConfig, resolving Strategy by name.
+func NewPool(cfg PoolConfig) (*Pool, error) {
 	backends := make([]*Backend, 0, len(cfg.Backends))
 	for _, bc := range cfg.Backends {
 		b, err := newBackend(bc.URL)
@@ -150,14 +156,18 @@ func NewPool(cfg PoolConf) (*Pool, error) {
 	}, nil
 }
 
+// HealthCheckEnabled reports whether active health checking is configured
+// for this pool.
 func (p *Pool) HealthCheckEnabled() bool {
 	return p.HealthCheck.Enabled
 }
 
+// Choose returns the next healthy backend per the pool's strategy.
 func (p *Pool) Choose() (*Backend, error) {
 	return p.Strategy.Next(p.Backends)
 }
 
+// MarkFailure implements passive circuit-breaker-lite behavior.
 func (p *Pool) MarkFailure(b *Backend) {
 	if b == nil {
 		return
@@ -173,6 +183,7 @@ func (p *Pool) MarkFailure(b *Backend) {
 	}
 }
 
+// MarkSuccess resets passive failure counters on a successful proxied response.
 func (p *Pool) MarkSuccess(b *Backend) {
 	if b == nil {
 		return
@@ -191,7 +202,7 @@ func (p *Pool) MarkSuccess(b *Backend) {
 // RunHealthChecks starts a blocking loop that periodically GETs
 // HealthCheck.Path on each backend, applying threshold hysteresis to flip
 // Alive state. Exits cleanly when ctx is canceled.
-func (p *Pool) RunHealthChecks(ctx context.Context, logger *slog.Logger) {
+func (p *Pool) RunHealthChecks(ctx context.Context, logger *Logger) {
 	interval := p.HealthCheck.IntervalDur
 	if interval <= 0 {
 		interval = 10 * time.Second
@@ -223,7 +234,7 @@ func (p *Pool) RunHealthChecks(ctx context.Context, logger *slog.Logger) {
 	}
 }
 
-func (p *Pool) probeOnce(ctx context.Context, client *http.Client, b *Backend, logger *slog.Logger) {
+func (p *Pool) probeOnce(ctx context.Context, client *http.Client, b *Backend, logger *Logger) {
 	path := p.HealthCheck.Path
 	if path == "" {
 		path = "/healthz"
@@ -266,11 +277,11 @@ func (p *Pool) probeOnce(ctx context.Context, client *http.Client, b *Backend, l
 	}
 }
 
-func (p *Pool) recordProbeFailure(b *Backend, _ *slog.Logger) {
+func (p *Pool) recordProbeFailure(b *Backend, _ *Logger) {
 	p.MarkFailure(b)
 }
 
-func (p *Pool) recordProbeSuccess(b *Backend, _ *slog.Logger) {
+func (p *Pool) recordProbeSuccess(b *Backend, _ *Logger) {
 	p.MarkSuccess(b)
 }
 
