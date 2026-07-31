@@ -1,6 +1,3 @@
-# Spins up the HTTP server plus two upstream backends to exercise
-# proxying + load-balancing, and a self-signed TLS cert generator.
-# =============================================================================
 version: "3.9"
 
 services:
@@ -9,7 +6,9 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: local-dev
+        VERSION: ${VERSION:-dev}
+        COMMIT_SHA: ${COMMIT_SHA:-local}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
     image: simple-http-server:local
     container_name: simple-http-server
     restart: unless-stopped
@@ -17,52 +16,42 @@ services:
       - "8080:8080"   # HTTP
       - "8443:8443"   # HTTPS
     environment:
+      - APP_ENV=development
       - LOG_LEVEL=debug
+      - TLS_CERT_PATH=/certs/tls.crt
+      - TLS_KEY_PATH=/certs/tls.key
+      - UPSTREAM_1=http://backend-1:9000
+      - UPSTREAM_2=http://backend-2:9000
       - LB_STRATEGY=round_robin
-      - UPSTREAMS=http://backend-a:80,http://backend-b:80
-      - TLS_CERT_FILE=/etc/simple-http-server/tls/server.crt
-      - TLS_KEY_FILE=/etc/simple-http-server/tls/server.key
     volumes:
-      - ./config/config.yaml:/etc/simple-http-server/config.yaml:ro
-      - ./certs:/etc/simple-http-server/tls:ro
-    depends_on:
-      backend-a:
-        condition: service_healthy
-      backend-b:
-        condition: service_healthy
-    networks:
-      - edge
+      - ./configs:/app/configs:ro
+      - ./certs:/certs:ro
     healthcheck:
-      test: ["CMD", "/app/server", "--healthcheck"]
+      test: ["CMD", "/app/simple-http-server", "--healthcheck"]
       interval: 15s
       timeout: 3s
       retries: 3
       start_period: 5s
-
-  backend-a:
-    image: hashicorp/http-echo:latest
-    container_name: backend-a
-    command: ["-text=response from backend-a", "-listen=:80"]
     networks:
-      - edge
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+      - edge-net
+    depends_on:
+      - backend-1
+      - backend-2
 
-  backend-b:
-    image: hashicorp/http-echo:latest
-    container_name: backend-b
-    command: ["-text=response from backend-b", "-listen=:80"]
+  backend-1:
+    image: hashicorp/http-echo:1.0
+    container_name: backend-1
+    command: ["-text=response-from-backend-1", "-listen=:9000"]
     networks:
-      - edge
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+      - edge-net
+
+  backend-2:
+    image: hashicorp/http-echo:1.0
+    container_name: backend-2
+    command: ["-text=response-from-backend-2", "-listen=:9000"]
+    networks:
+      - edge-net
 
 networks:
-  edge:
+  edge-net:
     driver: bridge
